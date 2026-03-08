@@ -343,6 +343,7 @@ void loop()
     {
       Control.Period_dd = pwmPeriod[0];
       Control.Pulso_dd = pwmHighTime[0];
+      Act_PWM[0] = false;
     }
     else
     {
