@@ -281,7 +281,7 @@ void setup()
     return;
   }
 
-  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_recv_cb(OnDataRecv); // Cuando recibas un paquete, ejecuta la función OnDataRecv
   
 
   esp_now_peer_info_t peerInfo = {};
