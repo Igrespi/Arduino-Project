@@ -72,7 +72,7 @@ typedef struct __attribute__((packed))
   int16_t gy;
   int16_t gz;
   //ESTADO
-   bool estado;   //true es encendio, falase es apagado  
+   bool estado;   //true es encendio, false es apagado  
 } SensorPacket;
 
 typedef struct __attribute__((packed)) 
