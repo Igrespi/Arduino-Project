@@ -97,10 +97,14 @@ ControlPacket Control;
 bool Act_PWM[] = {false, false, false, false};
 uint8_t slave_mac[] = { 0x3C, 0x8A, 0x1F, 0xA0, 0xE2, 0xE8 }; // Reemplaza con MAC real del slave
 
+volatile unsigned long t_recv_time = 0;  // Timestamp recepción ESP-NOW
 unsigned long send_time = 0;
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) 
 {
+  t_recv_time = micros();
+  unsigned long roundtrip = t_recv_time - send_time;
+
   if (len != sizeof(DataSensores)) 
   {
     Serial.println("Tamaño incorrecto del paquete recibido");
@@ -108,6 +112,9 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   }
   
   memcpy(&received, incomingData, sizeof(DataSensores));
+
+  // REPORTE: Tiempo round-trip ESP-NOW
+  Serial.printf("FASE2 | RoundTrip_ESPNOW=%lu us\n", roundtrip);
 
   //Serial.println("📥 Paquete recibido del slave:");
 
@@ -393,8 +400,10 @@ void loop()
       
       send_time = micros(); // Marcar tiempo justo antes de enviar
 
-
+      unsigned long t_before_send = micros();
       esp_now_send(slave_mac, (uint8_t *)&Control, sizeof(Control));
+      unsigned long t_after_send = micros();
+      Serial.printf("FASE2 | ESPNOW_send_time=%lu us\n", t_after_send - t_before_send);
 
  //     digitalWrite(PRUEBA_PIN, LOW);
       Serial.printf("     Tiempo: %d  ", millis());
@@ -407,41 +416,46 @@ void loop()
 
  if((now - I2C_time > I2C_Period) & (Sincr_PWM == true))
   {
+    unsigned long t_i2c_start = micros();
+
     digitalWrite(PRUEBA_PIN, HIGH);
-      int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, data, sizeof(data), 0);
+    int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, data, sizeof(data), 0);
 
-      if (len > 0) 
-      {
-        // El maestro ha escrito algo (probablemente la dirección del registro)
-        i2c_register_pointer = data[0]; // guardamos dirección de registro
-        //   Serial.print("Registro solicitado: 0x");
-        //   Serial.println(i2c_register_pointer, HEX);
-        }
-
-      // Si se ha solicitado una lectura
-      if (i2c_register_pointer == 0x3B) 
-      {
-        uint8_t response[14];
-        //received.ax=10850;
-        //received.ay=-10869;
-        //received.az=10870;
-        //received.tmp=7;
-        //received.gx=8;
-        //received.gy=9;
-        //received.gz=10;
-        int16_t values[] = { received.ax, received.ay, received.az, received.tmp, received.gx, received.gy, received.gz };
-
-        for (int i = 0; i < 7; i++) 
-        {
-          response[2 * i] = (values[i] >> 8) & 0xFF;     // MSB
-          response[2 * i + 1] = values[i] & 0xFF;        // LSB
-        }
-  
-        i2c_slave_write_buffer(I2C_SLAVE_NUM, response, sizeof(response), 0 / portTICK_PERIOD_MS);
-        i2c_register_pointer = 0x00; // Reset después de escribir
-        I2C_time = now;
-        //Serial.println("Lectura I2C");
+    if (len > 0) 
+    {
+      // El maestro ha escrito algo (probablemente la dirección del registro)
+      i2c_register_pointer = data[0]; // guardamos dirección de registro
+      //   Serial.print("Registro solicitado: 0x");
+      //   Serial.println(i2c_register_pointer, HEX);
       }
+
+    // Si se ha solicitado una lectura
+    if (i2c_register_pointer == 0x3B) 
+    {
+      uint8_t response[14];
+      //received.ax=10850;
+      //received.ay=-10869;
+      //received.az=10870;
+      //received.tmp=7;
+      //received.gx=8;
+      //received.gy=9;
+      //received.gz=10;
+      int16_t values[] = { received.ax, received.ay, received.az, received.tmp, received.gx, received.gy, received.gz };
+
+      for (int i = 0; i < 7; i++) 
+      {
+        response[2 * i] = (values[i] >> 8) & 0xFF;     // MSB
+        response[2 * i + 1] = values[i] & 0xFF;        // LSB
+      }
+
+      i2c_slave_write_buffer(I2C_SLAVE_NUM, response, sizeof(response), 0 / portTICK_PERIOD_MS);
+      i2c_register_pointer = 0x00; // Reset después de escribir
+      I2C_time = now;
+      //Serial.println("Lectura I2C");
+    }
+    unsigned long t_i2c_end = micros();
+    Serial.printf("FASE2 | I2C_write=%lu us\n", t_i2c_end - t_i2c_start);
+
   }
   else
           digitalWrite(PRUEBA_PIN, LOW);
