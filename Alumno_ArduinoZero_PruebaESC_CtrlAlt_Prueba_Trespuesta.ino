@@ -237,13 +237,23 @@ void setup()
   delay(STARTUP_MS);
 }
 
+// === FASE 1: Medir tiempos internos del Arduino Zero ===
+unsigned long loop_start, loop_end;
+unsigned long t_IMU_start, t_IMU_end;
+unsigned long t_ultra_start, t_ultra_end;
+unsigned long t_ctrl_start, t_ctrl_end;
+unsigned long t_pwm_start, t_pwm_end;
+unsigned long t_actlz_start, t_actlz_end;
+
 void loop() 
 {
+  loop_start = micros();
 
 //****************MEDIDA DE LA IMU****************************
 
   if (micros() - LastMedIMU > PeriodMedIMU) 
   {
+  t_IMU_start = micros();
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
   Wire.endTransmission(false);
@@ -256,6 +266,7 @@ void loop()
   IMU.gy = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
   IMU.gz = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
   LastMedIMU = micros();
+  t_IMU_end = micros();
 
 /*
 Serial.print("Tiempo = "); 
@@ -281,6 +292,8 @@ Serial.println(IMU.ay);
   // Paso 1: Enviar pulso TRIG cada 20 ms
   if ((Estado_ultrsnd == INICIAL) && micros() - lastTriggerTime >= PeriodMedUltsnd) 
   {
+    t_ultra_start = micros();
+
 //    Serial.print("Altura: ");
 //    Serial.println(Dist_ultrasonicos, 2); // 2 decimales
     // Enviar pulso de 20 us   
@@ -289,11 +302,13 @@ Serial.println(IMU.ay);
     digitalWrite(TRIG_PIN, LOW);
     lastTriggerTime = micros();
     Estado_ultrsnd = ECHO_START;      //Espera señal ECHO  
+    t_ultra_end = micros();
   }
 
 //*******************Control************************
   if (micros() - LastCtrl > Periodo_Ctrl) 
   {
+  t_ctrl_start = micros();
   // Calculo de errores
   float Error_alt;
   float Error_incl;
@@ -327,12 +342,14 @@ Serial.println(IMU.ay);
   //Establece consigna de motores
   Consgn_motor_ascnd = Min_Consg_motor;   //Descarga motor con mínima potencia
   Consgn_motor_incl = 0;
-    
+  t_ctrl_end = micros();
+
+  t_pwm_start = micros();
   setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_dd);           
   setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_di); 
   setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_td); 
   setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_ti); 
-  
+  t_pwm_end = micros();
   
   
   Serial.print("Tiempo = "); 
@@ -387,13 +404,34 @@ Serial.print(" Trhole_dd = ");
 //Actualiza estado motores
   if (micros() - LastActlz > Periodo_Actlz) 
   {
+  t_actlz_start = micros();
   LastActlz = micros();
   updateThrottle(esc_dd, Ref_dd);
   updateThrottle(esc_di, Ref_di);
   updateThrottle(esc_td, Ref_td);
   updateThrottle(esc_ti, Ref_ti);
+  t_actlz_end = micros();
   }
+  
+  loop_end = micros();
 
- 
-
+  // === REPORTE cada 500ms ===
+  static unsigned long lastReport = 0;
+  if (millis() - lastReport > 500) 
+  {
+    Serial.print("FASE1 | Loop_total=");
+    Serial.print(loop_end - loop_start);
+    Serial.print("us | IMU=");
+    Serial.print(t_IMU_end - t_IMU_start);
+    Serial.print("us | Ultra=");
+    Serial.print(t_ultra_end - t_ultra_start);
+    Serial.print("us | Ctrl=");
+    Serial.print(t_ctrl_end - t_ctrl_start);
+    Serial.print("us | PWM_gen=");
+    Serial.print(t_pwm_end - t_pwm_start);
+    Serial.print("us | Actlz_gen=");
+    Serial.print(t_actlz_end - t_actlz_start);
+    Serial.println("us");
+    lastReport = millis();
+  }
 }
