@@ -131,6 +131,8 @@ void ActualizarPWM(uint8_t pwmPin, uint32_t Periodo, uint32_t* Periodo_ant, uint
 
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) 
 {
+  unsigned long t_recv = micros();
+
   // Verificar si el mensaje viene del master autorizado
   if (memcmp(info->src_addr, master_mac, 6) != 0) 
   {
@@ -147,6 +149,7 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
 
   ControlPacket received;
   memcpy(&received, incomingData, sizeof(received));
+  unsigned long t_after_copy = micros();
 
  // Serial.println("📥 Paquete recibido:");
 /* 
@@ -173,14 +176,16 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   Serial.printf("Actualiza PWMdd: %d ",  received.Pulso_dd);
   
   Serial.printf(" Tiempo: %d \n", millis());
+  unsigned long t_pwm_start = micros();
   ActualizarPWM(MOTORdd,received.Period_dd,&Periodo_ant[0], received.Pulso_dd);
   ActualizarPWM(MOTORdi,received.Period_di,&Periodo_ant[1], received.Pulso_di);
   ActualizarPWM(MOTORtd,received.Period_td,&Periodo_ant[2], received.Pulso_td);
   ActualizarPWM(MOTORti,received.Period_ti,&Periodo_ant[3], received.Pulso_ti);
-
+  unsigned long t_pwm_end = micros();
 
   // Responder con un mensaje inmediato con las medidas de los sensores en el drone
-
+  
+  unsigned long t_sensor_start = micros();
   data_sensores.ax=AcX_filtr;
   data_sensores.ay=AcY_filtr;
   data_sensores.az=AcZ_filtr;
@@ -189,12 +194,14 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   data_sensores.gz=GZ_filtr;
   data_sensores.tmp=Tmp_filtr;
   data_sensores.estado=true;
-
+  unsigned long t_sensor_end = micros();
 
   //data_sensores.echoStartTime=100;
   //data_sensores.echoEndTime=300;
-
+  unsigned long t_send_start = micros();
   esp_err_t result = esp_now_send(master_mac, (uint8_t *)&data_sensores, sizeof(data_sensores));
+  unsigned long t_send_end = micros();
+  unsigned long total = t_send_end - t_recv;
   if (result == ESP_OK) 
   {
     //Serial.println("Respuesta enviada al master");
@@ -203,6 +210,13 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   {
     Serial.println("Error al enviar respuesta");
   }
+
+  Serial.printf("FASE3 | Total_OnRecv=%lu us | memcpy=%lu | PWM=%lu | Sensor=%lu | Send=%lu us\n",
+    total,
+    t_after_copy - t_recv,
+    t_pwm_end - t_pwm_start,
+    t_sensor_end - t_sensor_start,
+    t_send_end - t_send_start);
 }
 
 //Interrupción del sensor de ultrasonidos
@@ -377,6 +391,7 @@ void loop()
   //Nueva medida de la IMU
   if (millis() - LastMedIMU > PeriodMedIMU) 
   {
+  unsigned long t_imu_start = micros();
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
   Wire.endTransmission(false);
@@ -388,13 +403,14 @@ void loop()
   GX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
   GY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
   GZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+  unsigned long t_imu_end = micros();
 
 /*
   AcX=AcXprue;  //Prueba de tiempo de respuesta
   AcY=AcYprue;  //Prueba de tiempo de respuesta
   AcZ=AcZprue;  //Prueba de tiempo de respuesta
 */
-
+  unsigned long t_filter_start = micros();
   AcX_filtr = AcX_filtr*alpha+AcX*(1-alpha);
   AcY_filtr = AcY_filtr*alpha+AcY*(1-alpha);
   AcZ_filtr = AcZ_filtr*alpha+AcZ*(1-alpha);
@@ -404,6 +420,7 @@ void loop()
   GX_filtr = GX_filtr*alpha+GX*(1-alpha);
   GY_filtr = GY_filtr*alpha+GY*(1-alpha);
   GZ_filtr = GZ_filtr*alpha+GZ*(1-alpha);
+  unsigned long t_filter_end = micros();
 /*  
   Serial.print(" | AcY = "); Serial.print(AcY);
   Serial.print(" | AcY_Filtr = "); Serial.print(AcY_filtr);
@@ -414,6 +431,9 @@ void loop()
   Serial.print(" | GyZ = "); Serial.print(data_sensores.gz);
   Serial.println(); 
  */
+  Serial.printf("FASE3 | IMU_read=%lu us | Filter=%lu us\n",
+    t_imu_end - t_imu_start,
+    t_filter_end - t_filter_start);
 
   LastMedIMU = millis();
   }
