@@ -6,6 +6,9 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include<Wire.h>
+
+// === Activar/desactivar prints dentro del callback (0=desactivado, 1=activado) ===
+#define CB_PRINTS 0
 //****Prueba tiempo respuesta*********
 unsigned long lastPulsoPrueba=0;
 int16_t AcXprue,AcYprue,AcZprue;
@@ -104,6 +107,30 @@ uint8_t master_mac[] = { 0xA8, 0x42, 0xE3, 0xCD, 0x69, 0x18 };  // Ejemplo
 //Variables para detectar desconexión del master y parar los motores
 unsigned long lastCommTime = 0; // tiempo en micros o millis
 
+// === Estadísticas de instrumentación ===
+struct Stats {
+  unsigned long count;
+  unsigned long sum;
+  unsigned long maxVal;
+};
+
+static inline void updateStats(Stats &s, unsigned long val) {
+  s.count++;
+  s.sum += val;
+  if (val > s.maxVal) s.maxVal = val;
+}
+
+static inline void resetStats(Stats &s) {
+  s.count = 0;
+  s.sum   = 0;
+  s.maxVal = 0;
+}
+
+// Estadísticas del callback OnDataRecv
+Stats st_cb_total, st_cb_memcpy, st_cb_pwm, st_cb_sensor, st_cb_send;
+// Estadísticas IMU (acumuladas en loop y reportadas cada 1000 ms)
+Stats st_imu_read, st_imu_filter;
+
 
 //Funciones para el control de motores
 uint32_t Periodo_ant[] = {100,100,100,100};
@@ -136,14 +163,17 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   // Verificar si el mensaje viene del master autorizado
   if (memcmp(info->src_addr, master_mac, 6) != 0) 
   {
+#if CB_PRINTS
     Serial.println("Mensaje de MAC no autorizada, ignorado.");
+#endif
     return;
   }
 
-  //Serial.printf("Mensaje recibido del master: %s\n", incomingData);
   if (len != sizeof(ControlPacket)) 
   {
-    Serial.println("❌ Tamaño de paquete incorrecto");
+#if CB_PRINTS
+    Serial.println("Tamaño de paquete incorrecto");
+#endif
     return;
   }
 
@@ -151,72 +181,51 @@ void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   memcpy(&received, incomingData, sizeof(received));
   unsigned long t_after_copy = micros();
 
- // Serial.println("📥 Paquete recibido:");
-/* 
-  Serial.printf("  Periodo_dd: %d", received.Period_dd);
-  Serial.printf("  Periodo_di: %d", received.Period_di);
-  Serial.printf("  Periodo_td: %d", received.Period_td);
-  Serial.printf("  Periodo_ti: %d", received.Period_ti);
-  Serial.printf("  Pulso_dd: %d", received.Pulso_dd);
-  Serial.printf("  Pulso_di: %d", received.Pulso_di);
-  Serial.printf("  Pulso_td: %d", received.Pulso_td);
-  Serial.printf("  Pulso_ti: %d\n", received.Pulso_ti);
-//  Serial.printf("  Estado: %s\n", received.estado ? "Encendido" : "Apagado");
-
-*/
-
-
-  // ✅ Actualizar tiempo de última comunicación válida
+  // Actualizar tiempo de última comunicación válida
   lastCommTime = millis();
 
-  //Actualizar señales PWM de control
-
+#if CB_PRINTS
   Serial.printf("Distancia: %.2f   ",  data_sensores.Dist_ultrasonicos);
   Serial.printf("AcYfiltr: %.2f   ", AcY_filtr);
   Serial.printf("Actualiza PWMdd: %d ",  received.Pulso_dd);
-  
   Serial.printf(" Tiempo: %d \n", millis());
+#endif
+
+  //Actualizar señales PWM de control
   unsigned long t_pwm_start = micros();
-  ActualizarPWM(MOTORdd,received.Period_dd,&Periodo_ant[0], received.Pulso_dd);
-  ActualizarPWM(MOTORdi,received.Period_di,&Periodo_ant[1], received.Pulso_di);
-  ActualizarPWM(MOTORtd,received.Period_td,&Periodo_ant[2], received.Pulso_td);
-  ActualizarPWM(MOTORti,received.Period_ti,&Periodo_ant[3], received.Pulso_ti);
+  ActualizarPWM(MOTORdd, received.Period_dd, &Periodo_ant[0], received.Pulso_dd);
+  ActualizarPWM(MOTORdi, received.Period_di, &Periodo_ant[1], received.Pulso_di);
+  ActualizarPWM(MOTORtd, received.Period_td, &Periodo_ant[2], received.Pulso_td);
+  ActualizarPWM(MOTORti, received.Period_ti, &Periodo_ant[3], received.Pulso_ti);
   unsigned long t_pwm_end = micros();
 
   // Responder con un mensaje inmediato con las medidas de los sensores en el drone
-  
   unsigned long t_sensor_start = micros();
-  data_sensores.ax=AcX_filtr;
-  data_sensores.ay=AcY_filtr;
-  data_sensores.az=AcZ_filtr;
-  data_sensores.gx=GX_filtr;
-  data_sensores.gy=GY_filtr;
-  data_sensores.gz=GZ_filtr;
-  data_sensores.tmp=Tmp_filtr;
-  data_sensores.estado=true;
+  data_sensores.ax  = AcX_filtr;
+  data_sensores.ay  = AcY_filtr;
+  data_sensores.az  = AcZ_filtr;
+  data_sensores.gx  = GX_filtr;
+  data_sensores.gy  = GY_filtr;
+  data_sensores.gz  = GZ_filtr;
+  data_sensores.tmp = Tmp_filtr;
+  data_sensores.estado = true;
   unsigned long t_sensor_end = micros();
 
-  //data_sensores.echoStartTime=100;
-  //data_sensores.echoEndTime=300;
   unsigned long t_send_start = micros();
   esp_err_t result = esp_now_send(master_mac, (uint8_t *)&data_sensores, sizeof(data_sensores));
   unsigned long t_send_end = micros();
-  unsigned long total = t_send_end - t_recv;
-  if (result == ESP_OK) 
-  {
-    //Serial.println("Respuesta enviada al master");
-  } 
-  else 
-  {
-    Serial.println("Error al enviar respuesta");
-  }
 
-  Serial.printf("FASE3 | Total_OnRecv=%lu us | memcpy=%lu | PWM=%lu | Sensor=%lu | Send=%lu us\n",
-    total,
-    t_after_copy - t_recv,
-    t_pwm_end - t_pwm_start,
-    t_sensor_end - t_sensor_start,
-    t_send_end - t_send_start);
+#if CB_PRINTS
+  if (result != ESP_OK)
+    Serial.println("Error al enviar respuesta");
+#endif
+
+  // Acumular estadísticas sin Serial para no contaminar los tiempos
+  updateStats(st_cb_memcpy, t_after_copy - t_recv);
+  updateStats(st_cb_pwm,    t_pwm_end    - t_pwm_start);
+  updateStats(st_cb_sensor, t_sensor_end - t_sensor_start);
+  updateStats(st_cb_send,   t_send_end   - t_send_start);
+  updateStats(st_cb_total,  t_send_end   - t_recv);
 }
 
 //Interrupción del sensor de ultrasonidos
@@ -395,14 +404,14 @@ void loop()
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
-  AcX=Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
-  AcY=Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  AcZ=Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-  Tmp=Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-  GX=Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-  GY=Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-  GZ=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+  Wire.requestFrom(MPU_addr, 14, true);  // request a total of 14 registers
+  AcX = Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
+  AcY = Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+  AcZ = Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+  Tmp = Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
+  GX  = Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+  GY  = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+  GZ  = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
   unsigned long t_imu_end = micros();
 
 /*
@@ -421,24 +430,47 @@ void loop()
   GY_filtr = GY_filtr*alpha+GY*(1-alpha);
   GZ_filtr = GZ_filtr*alpha+GZ*(1-alpha);
   unsigned long t_filter_end = micros();
-/*  
-  Serial.print(" | AcY = "); Serial.print(AcY);
-  Serial.print(" | AcY_Filtr = "); Serial.print(AcY_filtr);
-  Serial.print(" | AcY = "); Serial.print(data_sensores.ay);
-  Serial.print(" | Tmp = "); Serial.print(data_sensores.tmp/340.00+36.53);  //equation for temperature in degrees C from datasheet
-  Serial.print(" | GyX = "); Serial.print(data_sensores.gx);
-  Serial.print(" | GyY = "); Serial.print(data_sensores.gy);
-  Serial.print(" | GyZ = "); Serial.print(data_sensores.gz);
-  Serial.println(); 
- */
-  Serial.printf("FASE3 | IMU_read=%lu us | Filter=%lu us\n",
-    t_imu_end - t_imu_start,
-    t_filter_end - t_filter_start);
+
+  // Acumular estadísticas IMU para el reporte periódico
+  updateStats(st_imu_read,   t_imu_end    - t_imu_start);
+  updateStats(st_imu_filter, t_filter_end - t_filter_start);
 
   LastMedIMU = millis();
   }
-  
-  
+
+  // === REPORTE de métricas cada 1000 ms ===
+  static unsigned long lastReport = 0;
+  if (millis() - lastReport >= 1000)
+  {
+    Serial.println("--- Reporte Slave 1000ms ---");
+    if (st_cb_total.count > 0) {
+      Serial.printf("CB_total  : cnt=%lu avg=%lu max=%lu us\n",
+        st_cb_total.count, st_cb_total.sum / st_cb_total.count, st_cb_total.maxVal);
+      Serial.printf("CB_memcpy : cnt=%lu avg=%lu max=%lu us\n",
+        st_cb_memcpy.count, st_cb_memcpy.sum / st_cb_memcpy.count, st_cb_memcpy.maxVal);
+      Serial.printf("CB_pwm    : cnt=%lu avg=%lu max=%lu us\n",
+        st_cb_pwm.count, st_cb_pwm.sum / st_cb_pwm.count, st_cb_pwm.maxVal);
+      Serial.printf("CB_sensor : cnt=%lu avg=%lu max=%lu us\n",
+        st_cb_sensor.count, st_cb_sensor.sum / st_cb_sensor.count, st_cb_sensor.maxVal);
+      Serial.printf("CB_send   : cnt=%lu avg=%lu max=%lu us\n",
+        st_cb_send.count, st_cb_send.sum / st_cb_send.count, st_cb_send.maxVal);
+    }
+    if (st_imu_read.count > 0) {
+      Serial.printf("IMU_read  : cnt=%lu avg=%lu max=%lu us\n",
+        st_imu_read.count, st_imu_read.sum / st_imu_read.count, st_imu_read.maxVal);
+      Serial.printf("IMU_filter: cnt=%lu avg=%lu max=%lu us\n",
+        st_imu_filter.count, st_imu_filter.sum / st_imu_filter.count, st_imu_filter.maxVal);
+    }
+    resetStats(st_cb_total);
+    resetStats(st_cb_memcpy);
+    resetStats(st_cb_pwm);
+    resetStats(st_cb_sensor);
+    resetStats(st_cb_send);
+    resetStats(st_imu_read);
+    resetStats(st_imu_filter);
+    lastReport = millis();
+  }
+
       // Mostrar la distancia medida
       //  Serial.print("Echo End Time: ");
       //  Serial.print(data_sensores.echoEndTime);
