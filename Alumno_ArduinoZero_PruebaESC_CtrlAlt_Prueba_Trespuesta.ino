@@ -1,9 +1,6 @@
 #include <Servo.h>
 #include<Wire.h>
 
-// === Activar/desactivar prints de depuración (0=desactivado, 1=activado) ===
-#define DEBUG_PRINTS 0
-
 //**********Definiciones control***************
 #define Periodo_Ctrl 20000  //Periodo en microsegundos
 #define Periodo_Actlz  10000
@@ -246,22 +243,38 @@ void setup()
   lastTriggerTime = micros();
 }
 
-// === Estadísticas de instrumentación por bloque (count / sum / max) ===
-struct Stats {
+
+// === FASE 1: Medir tiempos internos del Arduino Zero ===
+unsigned long loop_start, loop_end;
+unsigned long t_IMU_start, t_IMU_end;
+unsigned long t_ultra_start, t_ultra_end;
+unsigned long t_ctrl_start, t_ctrl_end;
+unsigned long t_pwm_start, t_pwm_end;
+unsigned long t_actlz_start, t_actlz_end;
+
+// ===== Estadísticas de instrumentación por bloque (count / sum / max) =====
+typedef struct {
   unsigned long count;
   unsigned long sum;
   unsigned long maxVal;
-};
+} Stats;
 
-static inline void updateStats(Stats &s, unsigned long val) {
+// Prototipos (evita problemas del auto-prototype de Arduino IDE)
+static inline void updateStats(Stats &s, unsigned long val);
+static inline void resetStats(Stats &s);
+
+// Implementaciones
+static inline void updateStats(Stats &s, unsigned long val)
+{
   s.count++;
   s.sum += val;
   if (val > s.maxVal) s.maxVal = val;
 }
 
-static inline void resetStats(Stats &s) {
+static inline void resetStats(Stats &s)
+{
   s.count = 0;
-  s.sum   = 0;
+  s.sum = 0;
   s.maxVal = 0;
 }
 
@@ -272,43 +285,64 @@ void loop()
   unsigned long loop_start = micros();
 
 //****************MEDIDA DE LA IMU****************************
-
   if (micros() - LastMedIMU > PeriodMedIMU) 
   {
     unsigned long t0 = micros();
+
     Wire.beginTransmission(MPU_addr);
     Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
     Wire.endTransmission(false);
-    Wire.requestFrom(MPU_addr, 14, true);  // request a total of 14 registers
-    IMU.ax  = Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
-    IMU.ay  = Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-    IMU.az  = Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+    Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+    IMU.ax = Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
+    IMU.ay = Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
+    IMU.az = Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
     IMU.tmp = Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-    IMU.gx  = Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-    IMU.gy  = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-    IMU.gz  = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+    IMU.gx = Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
+    IMU.gy = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+    IMU.gz = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
     LastMedIMU = micros();
     updateStats(st_imu, micros() - t0);
+
+/*
+Serial.print("Tiempo = "); 
+Serial.print(millis());
+
+Serial.print("s  Ay = "); 
+Serial.println(IMU.ay);
+*/
+/*
+  Serial.print(" | AcX = "); Serial.print(IMU.ax);
+  Serial.print(" | AcY = "); Serial.print(IMU.ay);
+  Serial.print(" | AcZ = "); Serial.print(IMU.az);
+  Serial.print(" | Tmp = "); Serial.print(IMU.tmp/340.00+36.53);  //equation for temperature in degrees C from datasheet
+  Serial.print(" | GyX = "); Serial.print(IMU.gx);
+  Serial.print(" | GyY = "); Serial.print(IMU.gy);
+  Serial.print(" | GyZ = "); Serial.print(IMU.gz);
+  Serial.println();
+ */
+  
   } 
 
 //****************SENSOR ULTRASONICO****************************
-  // Paso 1: Enviar pulso TRIG cada PeriodMedUltsnd µs
+  // Paso 1: Enviar pulso TRIG cada PeriodMedUltsnd (20 ms)
   if ((Estado_ultrsnd == INICIAL) && micros() - lastTriggerTime >= PeriodMedUltsnd) 
   {
     unsigned long t0 = micros();
-    // Enviar pulso de 20 us
+
+    // Enviar pulso de 20 us   
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(20);  //Pulso de 20us
     digitalWrite(TRIG_PIN, LOW);
     lastTriggerTime = micros();
-    Estado_ultrsnd = ECHO_START;      //Espera señal ECHO
+    Estado_ultrsnd = ECHO_START;      //Espera señal ECHO  
     updateStats(st_ultra, micros() - t0);
   }
 
 //*******************Control************************
   if (micros() - LastCtrl > Periodo_Ctrl) 
   {
-    unsigned long t0 = micros();
+    unsigned long t0 = micros();  
+    
     // Calculo de errores
     float Error_alt;
     float Error_incl;
@@ -321,16 +355,16 @@ void loop()
 
     // Lazo de control Proporcional Integral Derivativo
     Integral_asc += Error_alt*Periodo_Ctrl*KI_asc/1000000.;
-    Integral_asc = constrain(Integral_asc,Min_Consg_motor,Max_Consg_motor);
+    Integral_asc= constrain(Integral_asc,Min_Consg_motor,Max_Consg_motor);
 
     Integral_incl += Error_incl*Periodo_Ctrl*KI_incl/1000000.;
     Integral_incl = constrain(Integral_incl,-4,4);
 
-    Consgn_motor_ascnd = Error_alt*KP_asc+Integral_asc+(Error_alt-Error_alt_ant)*KD_asc/Periodo_Ctrl;
+    Consgn_motor_ascnd = Error_alt*KP_asc+Integral_asc+(Error_alt-Error_alt_ant)*KD_asc/Periodo_Ctrl;  
     Consgn_motor_ascnd = constrain(Consgn_motor_ascnd,Min_Consg_motor,Max_Consg_motor);
 
     Error_incl_derv = (Error_incl-Error_incl_ant)*KD_incl/Periodo_Ctrl;
-    Consgn_motor_incl = Error_incl*KP_incl+Integral_incl+Error_incl_derv;
+    Consgn_motor_incl = Error_incl*KP_incl+Integral_incl+Error_incl_derv;  
     Consgn_motor_incl = constrain(Consgn_motor_incl,-5,5);
 
     //Consgn_motor_incl=0;
@@ -343,31 +377,68 @@ void loop()
     Consgn_motor_incl = 0;
     updateStats(st_ctrl, micros() - t0);
 
-#if DEBUG_PRINTS
-    Serial.print("Tiempo = ");
-    Serial.print(millis());
-    Serial.print("s  Distancia = ");
-    Serial.print(Dist_ultrasonicos);
-    Serial.print("cm  Integral = ");
-    Serial.print(Integral_asc);
-    Serial.print(" Consigna_asc = ");
-    Serial.print(Consgn_motor_ascnd);
-    Serial.print(" Motor_dd = ");
-    Serial.println(throttleCurrentPct[Ref_dd]);
-#endif
-
     unsigned long t1 = micros();
-    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_dd);
-    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_di);
-    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_td);
-    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_ti);
-    updateStats(st_pwm, micros() - t1);
+    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_dd);           
+    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_di); 
+    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_td); 
+    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_ti); 
+    updateStats(st_pwm, micros() - t1);    
+    
+    Serial.print("Tiempo = "); 
+    Serial.print(millis());
+
+    Serial.print("s  Distancia = "); 
+    Serial.print(Dist_ultrasonicos);
+    
+    Serial.print("cm  Integral = "); 
+    Serial.print(Integral_asc);
+
+    Serial.print(" Consigna_asc = "); 
+    Serial.print(Consgn_motor_ascnd);
+    
+    Serial.print(" Motor_dd = "); 
+    Serial.println(throttleCurrentPct[Ref_dd]);
+
+
+/* 
+Serial.print("Tiempo = "); 
+Serial.print(millis());
+
+Serial.print("ms  Ay = "); 
+Serial.print(IMU.ay);
+
+Serial.print("  Az = "); 
+Serial.print(IMU.az);
+
+
+Serial.print("  Error_incl = "); 
+Serial.print(Error_incl);
+
+Serial.print("  Integral = "); 
+Serial.print(Integral_incl);
+
+Serial.print("  Derivativo = "); 
+Serial.print(Error_incl_derv);
+
+
+Serial.print(" Consigna_incl = "); 
+ Serial.print(Consgn_motor_incl);
+
+Serial.print(" Trhole_dd = "); 
+ Serial.print(throttleCurrentPct[0]);
+
+ Serial.print(" Trhole_di = "); 
+ Serial.println(throttleCurrentPct[1]);
+
+*/  
   }
+  
 
 //Actualiza estado motores
   if (micros() - LastActlz > Periodo_Actlz) 
   {
     unsigned long t0 = micros();
+
     LastActlz = micros();
     updateThrottle(esc_dd, Ref_dd);
     updateThrottle(esc_di, Ref_di);
@@ -377,38 +448,44 @@ void loop()
   }
 
   updateStats(st_loop, micros() - loop_start);
-
-  // === REPORTE cada 1000 ms ===
+  
+  // === REPORTE cada 1000ms ===
   static unsigned long lastReport = 0;
   if (millis() - lastReport >= 1000) 
   {
     Serial.println("--- Reporte 1000ms ---");
-    if (st_loop.count > 0) {
+    if (st_loop.count > 0) 
+    {
       Serial.print("Loop_total : cnt="); Serial.print(st_loop.count);
       Serial.print(" avg="); Serial.print(st_loop.sum / st_loop.count);
       Serial.print(" max="); Serial.print(st_loop.maxVal); Serial.println("us");
     }
-    if (st_imu.count > 0) {
+    if (st_imu.count > 0) 
+    {
       Serial.print("IMU        : cnt="); Serial.print(st_imu.count);
       Serial.print(" avg="); Serial.print(st_imu.sum / st_imu.count);
       Serial.print(" max="); Serial.print(st_imu.maxVal); Serial.println("us");
     }
-    if (st_ultra.count > 0) {
+    if (st_ultra.count > 0) 
+    {
       Serial.print("Ultra_trig : cnt="); Serial.print(st_ultra.count);
       Serial.print(" avg="); Serial.print(st_ultra.sum / st_ultra.count);
       Serial.print(" max="); Serial.print(st_ultra.maxVal); Serial.println("us");
     }
-    if (st_ctrl.count > 0) {
+    if (st_ctrl.count > 0) 
+    {
       Serial.print("Control    : cnt="); Serial.print(st_ctrl.count);
       Serial.print(" avg="); Serial.print(st_ctrl.sum / st_ctrl.count);
       Serial.print(" max="); Serial.print(st_ctrl.maxVal); Serial.println("us");
     }
-    if (st_pwm.count > 0) {
+    if (st_pwm.count > 0) 
+    {
       Serial.print("PWM_target : cnt="); Serial.print(st_pwm.count);
       Serial.print(" avg="); Serial.print(st_pwm.sum / st_pwm.count);
       Serial.print(" max="); Serial.print(st_pwm.maxVal); Serial.println("us");
     }
-    if (st_actlz.count > 0) {
+    if (st_actlz.count > 0) 
+    {
       Serial.print("ESC_actlz  : cnt="); Serial.print(st_actlz.count);
       Serial.print(" avg="); Serial.print(st_actlz.sum / st_actlz.count);
       Serial.print(" max="); Serial.print(st_actlz.maxVal); Serial.println("us");
