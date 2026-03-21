@@ -8,9 +8,6 @@
 #include <esp_now.h>
 #include "driver/i2c.h"
 #include "esp_timer.h"
-
-// === Activar/desactivar prints frecuentes (0=desactivado, 1=activado) ===
-#define MASTER_DEBUG_PRINTS 0
 //Definiciones comunicaciones wifi
 #define Transmdatos_Period 15000
 
@@ -123,6 +120,7 @@ Stats st_espnow_send, st_i2c_write, st_roundtrip;
 
 volatile unsigned long t_recv_time = 0;  // Timestamp recepción ESP-NOW
 unsigned long send_time = 0;
+
 // Flag para validar que el round-trip corresponde a una petición/respuesta real
 volatile bool awaiting_reply = false;
 
@@ -132,9 +130,7 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
 
   if (len != sizeof(DataSensores)) 
   {
-#if MASTER_DEBUG_PRINTS
     Serial.println("Tamaño incorrecto del paquete recibido");
-#endif
     return;
   }
   
@@ -146,12 +142,17 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
     updateStats(st_roundtrip, t_recv_time - send_time);
     awaiting_reply = false;
   }
+  //Serial.println("📥 Paquete recibido del slave:");
 
-#if MASTER_DEBUG_PRINTS
+  //Serial.printf("  Tiempo: %d  ", millis());
+  //Serial.printf("  Pulso.dd: %d\n", Control.Pulso_dd);
+ 
   Serial.printf("Tiempo: %d  ", millis());
   Serial.printf("  IMU.ay: %d  ", received.ay);
   Serial.printf("  Distancia: %d  \n", received.Dist_ultrasonicos);
-#endif
+
+  // Serial.printf("  Distancia: %f\n", received.Dist_ultrasonicos);
+  //Serial.printf("  Estado: %s\n", received.estado ? "Encendido" : "Apagado");
 }
   
 
@@ -431,11 +432,10 @@ void loop()
       unsigned long t_after_send = micros();
       updateStats(st_espnow_send, t_after_send - t_before_send);
 
-#if MASTER_DEBUG_PRINTS
+ //     digitalWrite(PRUEBA_PIN, LOW);
       Serial.printf("ESPNOW_send_time=%lu us\n", t_after_send - t_before_send);
       Serial.printf("     Tiempo: %d  ", millis());
-      Serial.printf("  Pulso_dd: %d  \n", Control.Pulso_dd);
-#endif
+      Serial.printf("  Pulso_dd: %d  \n",Control.Pulso_dd);
 
     }
 
@@ -453,12 +453,21 @@ void loop()
     {
       // El maestro ha escrito algo (probablemente la dirección del registro)
       i2c_register_pointer = data[0]; // guardamos dirección de registro
+      //   Serial.print("Registro solicitado: 0x");
+      //   Serial.println(i2c_register_pointer, HEX);
       }
 
     // Si se ha solicitado una lectura
     if (i2c_register_pointer == 0x3B) 
     {
       uint8_t response[14];
+      //received.ax=10850;
+      //received.ay=-10869;
+      //received.az=10870;
+      //received.tmp=7;
+      //received.gx=8;
+      //received.gy=9;
+      //received.gz=10;
       int16_t values[] = { received.ax, received.ay, received.az, received.tmp, received.gx, received.gy, received.gz };
 
       for (int i = 0; i < 7; i++) 
@@ -470,18 +479,16 @@ void loop()
       i2c_slave_write_buffer(I2C_SLAVE_NUM, response, sizeof(response), 0 / portTICK_PERIOD_MS);
       i2c_register_pointer = 0x00; // Reset después de escribir
       I2C_time = now;
+      //Serial.println("Lectura I2C");
     }
     unsigned long t_i2c_end = micros();
     updateStats(st_i2c_write, t_i2c_end - t_i2c_start);
 
-#if MASTER_DEBUG_PRINTS
     Serial.printf("I2C_write=%lu us\n", t_i2c_end - t_i2c_start);
-#endif
   }
   else
           digitalWrite(PRUEBA_PIN, LOW);
-
-
+  
   // === REPORTE cada 1000 ms ===
   static unsigned long lastReport = 0;
   if (millis() - lastReport >= 1000) 
@@ -502,7 +509,8 @@ void loop()
     lastReport = millis();
   }
 
- //Serial.printf("Periodo dd: %d  Periodo_di: %d \n", Control.Pulso_dd, Control.Pulso_di);
- //Serial.println(received.echoStartTime);
+
+  //Serial.printf("Periodo dd: %d  Periodo_di: %d \n", Control.Pulso_dd, Control.Pulso_di);
+  //Serial.println(received.echoStartTime);
 
 }
