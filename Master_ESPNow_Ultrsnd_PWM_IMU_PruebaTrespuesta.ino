@@ -8,6 +8,22 @@
 #include <esp_now.h>
 #include "driver/i2c.h"
 #include "esp_timer.h"
+
+// ===== Instrumentación simple =====
+typedef struct { uint32_t n, sum_us, max_us; } Stats;
+static inline void st_reset(Stats &s){ s.n=0; s.sum_us=0; s.max_us=0; }
+static inline void st_add(Stats &s, uint32_t dt){ s.n++; s.sum_us+=dt; if(dt>s.max_us) s.max_us=dt; }
+static inline uint32_t st_avg(const Stats &s){ return s.n? (s.sum_us/s.n):0; }
+
+#define MASTER_DEBUG_PRINTS 0
+
+static Stats st_send, st_roundtrip, st_i2c, st_cb;     // duraciones
+static Stats st_send_period;                           // periodo real entre envíos
+static uint32_t last_send_us = 0;
+
+static volatile bool awaiting_reply = false;
+static volatile uint32_t send_time_us = 0;
+
 //Definiciones comunicaciones wifi
 #define Transmdatos_Period 15000
 
@@ -97,36 +113,12 @@ ControlPacket Control;
 bool Act_PWM[] = {false, false, false, false};
 uint8_t slave_mac[] = { 0x3C, 0x8A, 0x1F, 0xA0, 0xE2, 0xE8 }; // Reemplaza con MAC real del slave
 
-// === Estadísticas de instrumentación ===
-struct Stats {
-  unsigned long count;
-  unsigned long sum;
-  unsigned long maxVal;
-};
 
-static inline void updateStats(Stats &s, unsigned long val) {
-  s.count++;
-  s.sum += val;
-  if (val > s.maxVal) s.maxVal = val;
-}
-
-static inline void resetStats(Stats &s) {
-  s.count = 0;
-  s.sum   = 0;
-  s.maxVal = 0;
-}
-
-Stats st_espnow_send, st_i2c_write, st_roundtrip;
-
-volatile unsigned long t_recv_time = 0;  // Timestamp recepción ESP-NOW
 unsigned long send_time = 0;
-
-// Flag para validar que el round-trip corresponde a una petición/respuesta real
-volatile bool awaiting_reply = false;
 
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) 
 {
-  t_recv_time = micros();
+  uint32_t t0 = micros();
 
   if (len != sizeof(DataSensores)) 
   {
@@ -136,23 +128,21 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   
   memcpy(&received, incomingData, sizeof(DataSensores));
 
-  // Round-trip solo se computa cuando realmente se esperaba una respuesta
   if (awaiting_reply) 
   {
-    updateStats(st_roundtrip, t_recv_time - send_time);
+    uint32_t rt = micros() - send_time_us;
+    st_add(st_roundtrip, rt);
     awaiting_reply = false;
   }
-  //Serial.println("📥 Paquete recibido del slave:");
 
-  //Serial.printf("  Tiempo: %d  ", millis());
-  //Serial.printf("  Pulso.dd: %d\n", Control.Pulso_dd);
- 
-  Serial.printf("Tiempo: %d  ", millis());
-  Serial.printf("  IMU.ay: %d  ", received.ay);
-  Serial.printf("  Distancia: %d  \n", received.Dist_ultrasonicos);
+  #if MASTER_DEBUG_PRINTS
+    //Serial.println("📥 Paquete recibido del slave:");
+    Serial.printf("Tiempo: %d  ", millis());
+    Serial.printf("  IMU.ay: %d  ", received.ay);
+    Serial.printf("  Distancia: %d  \n", received.Dist_ultrasonicos);
+  #endif
 
-  // Serial.printf("  Distancia: %f\n", received.Dist_ultrasonicos);
-  //Serial.printf("  Estado: %s\n", received.estado ? "Encendido" : "Apagado");
+  st_add(st_cb, micros() - t0);
 }
   
 
@@ -359,13 +349,11 @@ void loop()
     Sincr_PWM &= ((now - pwm_lastRiseTime[i] > 2000) & (now - pwm_lastRiseTime[i] < 18000)) | (pwm_lastRiseTime[i] == 0);
 
 
-//digitalWrite(PRUEBA_PIN, !digitalRead(PRUEBA_PIN));
-
 //Hacer un nueva solicitud a Slave
 
    if((now - send_time > Transmdatos_Period) & (Sincr_PWM == true))
     {
-//         digitalWrite(PRUEBA_PIN, HIGH);
+
   for(int i=0; i<4; i++)
     if(now - pwm_lastRiseTime[i] > 300000)
       Act_PWM[i] = false;
@@ -396,8 +384,8 @@ void loop()
       Control.Pulso_di = 950;
     }
    
-   if(Act_PWM[2] == true)
-   {
+    if(Act_PWM[2] == true)
+    {
       Control.Period_td = pwmPeriod[2];
       Control.Pulso_td = pwmHighTime[2];
       Act_PWM[2] = false;
@@ -421,22 +409,20 @@ void loop()
     }
 
       Control.estado = true;
-
-  //Serial.printf("Periodo dd: %d  Pulso_dd: %d \n", Control.Period_dd, Control.Pulso_dd);
-      
       send_time = micros(); // Marcar tiempo justo antes de enviar
+
+      uint32_t now_us = send_time;
+      if (last_send_us) st_add(st_send_period, now_us - last_send_us);
+      last_send_us = now_us;
+      send_time_us = now_us;
       awaiting_reply = true;
 
-      unsigned long t_before_send = micros();
+      uint32_t t0 = micros();
       esp_now_send(slave_mac, (uint8_t *)&Control, sizeof(Control));
-      unsigned long t_after_send = micros();
-      updateStats(st_espnow_send, t_after_send - t_before_send);
+      st_add(st_send, micros() - t0);
 
- //     digitalWrite(PRUEBA_PIN, LOW);
-      Serial.printf("ESPNOW_send_time=%lu us\n", t_after_send - t_before_send);
       Serial.printf("     Tiempo: %d  ", millis());
       Serial.printf("  Pulso_dd: %d  \n",Control.Pulso_dd);
-
     }
 
   //***************Comunicaciones I2C con la IMU**********************
@@ -444,8 +430,6 @@ void loop()
 
  if((now - I2C_time > I2C_Period) & (Sincr_PWM == true))
   {
-    unsigned long t_i2c_start = micros();
-
     digitalWrite(PRUEBA_PIN, HIGH);
     int len = i2c_slave_read_buffer(I2C_SLAVE_NUM, data, sizeof(data), 0);
 
@@ -479,38 +463,31 @@ void loop()
       i2c_slave_write_buffer(I2C_SLAVE_NUM, response, sizeof(response), 0 / portTICK_PERIOD_MS);
       i2c_register_pointer = 0x00; // Reset después de escribir
       I2C_time = now;
-      //Serial.println("Lectura I2C");
     }
-    unsigned long t_i2c_end = micros();
-    updateStats(st_i2c_write, t_i2c_end - t_i2c_start);
-
-    Serial.printf("I2C_write=%lu us\n", t_i2c_end - t_i2c_start);
   }
   else
           digitalWrite(PRUEBA_PIN, LOW);
   
   // === REPORTE cada 1000 ms ===
-  static unsigned long lastReport = 0;
-  if (millis() - lastReport >= 1000) 
+  static uint32_t rep_ms = 0;
+  if ((uint32_t)(millis() - rep_ms) >= 1000) 
   {
-    Serial.println("--- Reporte Master 1000ms ---");
-    if (st_espnow_send.count > 0)
-      Serial.printf("ESPNOW_send  : cnt=%lu avg=%lu max=%lu us\n",
-        st_espnow_send.count, st_espnow_send.sum / st_espnow_send.count, st_espnow_send.maxVal);
-    if (st_roundtrip.count > 0)
-      Serial.printf("RoundTrip_RT : cnt=%lu avg=%lu max=%lu us\n",
-        st_roundtrip.count, st_roundtrip.sum / st_roundtrip.count, st_roundtrip.maxVal);
-    if (st_i2c_write.count > 0)
-      Serial.printf("I2C_write    : cnt=%lu avg=%lu max=%lu us\n",
-        st_i2c_write.count, st_i2c_write.sum / st_i2c_write.count, st_i2c_write.maxVal);
-    resetStats(st_espnow_send);
-    resetStats(st_roundtrip);
-    resetStats(st_i2c_write);
-    lastReport = millis();
+    rep_ms = millis();
+
+    Serial.println("=== MASTER stats (1s) ===");
+    Serial.printf("send:      n=%lu avg=%luus max=%luus | period avg=%luus max=%luus\n",
+      (unsigned long)st_send.n, (unsigned long)st_avg(st_send), (unsigned long)st_send.max_us,
+      (unsigned long)st_avg(st_send_period), (unsigned long)st_send_period.max_us);
+
+    Serial.printf("roundtrip: n=%lu avg=%luus max=%luus\n",
+      (unsigned long)st_roundtrip.n, (unsigned long)st_avg(st_roundtrip), (unsigned long)st_roundtrip.max_us);
+
+    Serial.printf("i2c:       n=%lu avg=%luus max=%luus\n",
+      (unsigned long)st_i2c.n, (unsigned long)st_avg(st_i2c), (unsigned long)st_i2c.max_us);
+
+    Serial.printf("cb:        n=%lu avg=%luus max=%luus\n",
+      (unsigned long)st_cb.n, (unsigned long)st_avg(st_cb), (unsigned long)st_cb.max_us);
+
+    st_reset(st_send); st_reset(st_roundtrip); st_reset(st_i2c); st_reset(st_cb); st_reset(st_send_period);
   }
-
-
-  //Serial.printf("Periodo dd: %d  Periodo_di: %d \n", Control.Pulso_dd, Control.Pulso_di);
-  //Serial.println(received.echoStartTime);
-
 }
