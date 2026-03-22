@@ -275,15 +275,6 @@ void setup()
 }
 
 
-// === FASE 1: Medir tiempos internos del Arduino Zero ===
-unsigned long loop_start, loop_end;
-unsigned long t_IMU_start, t_IMU_end;
-unsigned long t_ultra_start, t_ultra_end;
-unsigned long t_ctrl_start, t_ctrl_end;
-unsigned long t_pwm_start, t_pwm_end;
-unsigned long t_actlz_start, t_actlz_end;
-
-
 void loop() 
 {
   const uint32_t loop_t0 = micros();
