@@ -1,414 +1,421 @@
 //*****************************************************************************
 //******************************SLAVE******************************************
-//**********************ESP32 EN LA BASE***************************************
-//***************************************************************************** 
+//**********************ESP32 EN LA DRONE***************************************
+//*****************************************************************************
 
 #include <WiFi.h>
 #include <esp_now.h>
-#include<Wire.h>
+#include <Wire.h>
+#include "esp_log.h"
 
-typedef struct { uint32_t n, sum_us, max_us; } Stats;
-static inline void st_reset(Stats &s){ s.n=0; s.sum_us=0; s.max_us=0; }
-static inline void st_add(Stats &s, uint32_t dt){ s.n++; s.sum_us+=dt; if(dt>s.max_us) s.max_us=dt; }
-static inline uint32_t st_avg(const Stats &s){ return s.n? (s.sum_us/s.n):0; }
-
-#define SLAVE_CB_PRINTS 0
-
-static Stats st_cb_total, st_cb_copy, st_cb_pwm, st_cb_sensor, st_cb_send;
-static volatile bool cb_dirty = false;
-
-// Cuenta cuántas veces reconfiguras frecuencia (ledcDetach/Attach)
-static volatile uint32_t pwm_recfg_count = 0;
-
-//****Prueba tiempo respuesta*********
-unsigned long lastPulsoPrueba=0;
-int16_t AcXprue,AcYprue,AcZprue;
+unsigned long lastPulsoPrueba = 0;
+int16_t AcXprue, AcYprue, AcZprue;
 #define PeriodoPrueba  1000000
 
-//**********Sensor ultrasonico*********
-// Definición de pines
-#define TRIG_PIN 5
-#define ECHO_PIN 18
-// Pines de prueba
+#define TRIG_PIN   5
+#define ECHO_PIN   18
 #define PRUEBA_PIN 17
-// Variables de control de tiempo y estado para el sensor ultrasónico
+
 unsigned long lastTriggerTime = 0;
-unsigned long echoStartTime = 0;
-unsigned long echoEndTime = 0;
-
-enum EstadosUltrsnd 
-{
-  INICIAL,
-  PULSO_TRIGGER,
-  ECHO_START,
-  ECHO_END
-};
+unsigned long echoStartTime   = 0;
+unsigned long echoEndTime     = 0;
+enum EstadosUltrsnd { INICIAL, PULSO_TRIGGER, ECHO_START, ECHO_END };
 EstadosUltrsnd Estado_ultrsnd = INICIAL;
-#define PeriodMedUltrsn 20   //Periodo de medida de ultrasonidos milisegundos
+#define PeriodMedUltrsn 15000UL // 20000UL
 
-//**********Control PWM de motores**********
-//Definición de pines
 #define MOTORdd  32
 #define MOTORdi  33
 #define MOTORtd  25
 #define MOTORti  26
 
-//Definiciones
-const int resolucion = 10; //10 bits
-const int max_valor = 1023;   //Valora máximo para 10 bits
+const int resolucion = 10;
+const int max_valor  = 1023;
 
-//*************IMU****************************
-const int MPU_addr = 0x68;  // I2C address of the MPU-6050
-int16_t AcX,AcY,AcZ,Tmp,GX,GY,GZ;
-float AcX_filtr, AcY_filtr, AcZ_filtr,Tmp_filtr,GX_filtr, GY_filtr, GZ_filtr;
+const int MPU_addr = 0x68;
+int16_t AcX, AcY, AcZ, Tmp, GX, GY, GZ;
+volatile float AcX_filtr, AcY_filtr, AcZ_filtr, Tmp_filtr, GX_filtr, GY_filtr, GZ_filtr;
 unsigned long LastMedIMU;
-const unsigned long PeriodMedIMU = 2;  //milisegundos entre medidas de la IMU
+const unsigned long PeriodMedIMU = 2;
 #define alpha 0.9
-//*************Comunicaciones*******************
-const unsigned long commTimeout = 1000; // milisegundos sin comunicación para activar apagado
 
-//Estructura de datos de comunicaciones ESP32 Now
-typedef struct __attribute__((packed)) 
+const unsigned long commTimeout = 1000;
+
+float inclinacion;
+const float ANGULO_MAX = 45.0f;
+// ============================================================
+//  TEST DE LATENCIA (MEDIDO DESDE SLAVE)
+//  Slave envía periódicamente data_sensores.tmp = SENTINEL_TMP_VALUE
+//  y guarda T1.
+//  Alumno rebota la señal con un salto en PWM.
+//  Cuando Slave recibe un Pulso_dd mayor a pwmBaseline + UMBRAL,
+//  calcula T2 y muestra la latencia.
+
+#define SENTINEL_TMP_VALUE   30000   // mismo valor que SENTINEL_TMP en Alumno
+#define UMBRAL_PWM_CAMBIO    100     // cambio minimo en us para considerar escalon nuevo
+#define LATENCY_STEP_MS      2000UL  // periodo del escalon en ms
+
+int16_t pwmBaseline          = 0;
+bool    baselineInicializado = false; // ultimo Pulso_dd recibido (referencia)
+volatile bool          stepActivo         = false;
+volatile unsigned long lastStepMs         = 0;
+volatile unsigned long T1_latencia        = 0;
+volatile bool          esperandoRespuesta = false;
+
+uint32_t lat_min   = UINT32_MAX;
+uint32_t lat_max   = 0;
+uint32_t lat_suma  = 0;
+uint32_t lat_count = 0;
+// ============================================================
+
+typedef struct __attribute__((packed))
 {
-  //ULTRASONIDOS
-  float Dist_ultrasonicos;
-  unsigned long echoStartTime;
-  unsigned long echoEndTime;
-
-  //IMU ACELERÓMETRO
-  int16_t ax;
-  int16_t ay;
-  int16_t az;
-  //IMU temperatura:
-  int16_t tmp;
-  //IMU GIROSCOPIO
-  int16_t gx;
-  int16_t gy;
-  int16_t gz;
-  //ESTADO
-   bool estado;   //true es encendio, false es apagado  
+  float          Dist_ultrasonicos;
+  unsigned long  echoStartTime;
+  unsigned long  echoEndTime;
+  int16_t ax, ay, az, tmp, gx, gy, gz;
+  bool           estado;
 } SensorPacket;
-
-typedef struct __attribute__((packed)) 
-{
-  //MOTOR DELANTERO DERECHO
-  int16_t Period_dd;   //Microsegundos
-  int16_t Pulso_dd;    //Microsegundos
-
-  //MOTOR DELANTERO IZQUIERDO
-  int16_t Period_di;   //Microsegundos
-  int16_t Pulso_di;    //Microsegundos
-
-  //MOTOR TRASERO DERECHO
-  int16_t Period_td;   //Microsegundos
-  int16_t Pulso_td;    //Microsegundos
-
-  //MOTOR TRASERO IZQUIERDO
-  int16_t Period_ti;   //Microsegundos
-  int16_t Pulso_ti;    //Microsegundos
-  //ESTADO
-  bool estado;   //true es encendio, falase es apagado
-} ControlPacket;
-
 SensorPacket data_sensores;
 
-// ✅ MAC del MASTER autorizado (reemplázala con la real)
-uint8_t master_mac[] = { 0xA8, 0x42, 0xE3, 0xCD, 0x69, 0x18 };  // Ejemplo
-
-//Variables para detectar desconexión del master y parar los motores
-unsigned long lastCommTime = 0; // tiempo en micros o millis
-
-
-
-//Funciones para el control de motores
-uint32_t Periodo_ant[] = {100,100,100,100};
-
-void ActualizarPWM(uint8_t pwmPin, uint32_t Periodo, uint32_t* Periodo_ant, uint32_t Pulso )
-  {
-    if((Periodo > 1000) & (Periodo < 100000) & (Pulso < Periodo))
-    {
-      if((Periodo > *Periodo_ant + 100) | (Periodo < *Periodo_ant - 100))
-      {
-        pwm_recfg_count++;
-
-        uint32_t frec = 1E6/Periodo;
-        //ledcChangeFrequency(pwmPin, frec, resolucion);
-        ledcDetach(pwmPin);
-        ledcAttach(pwmPin,frec,resolucion);
-        *Periodo_ant=Periodo;
-      }
-      
-      uint32_t Ciclotrabajo=(max_valor*Pulso)/Periodo;
-      ledcWrite(pwmPin, Ciclotrabajo);
-
-    }
-    else ledcWrite(pwmPin,0);  
-  } 
-
-
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) 
+typedef struct __attribute__((packed))
 {
-  const uint32_t t0 = micros();
+  int16_t Period_dd, Pulso_dd;
+  int16_t Period_di, Pulso_di;
+  int16_t Period_td, Pulso_td;
+  int16_t Period_ti, Pulso_ti;
+  bool    estado;
+} ControlPacket;
+ControlPacket paqueteRecibido;
 
-  // Verificar si el mensaje viene del master autorizado
-  if (memcmp(info->src_addr, master_mac, 6) != 0) 
+uint8_t master_mac[] = { 0xA8, 0x42, 0xE3, 0xCD, 0x69, 0x18 };
+unsigned long lastCommTime = 0;
+uint32_t Periodo_ant[]     = {100, 100, 100, 100};
+
+volatile bool nuevoPaquete  = false;
+volatile bool nuevaMedida  = false;
+
+// Variables globales para almacenar la última lectura limpia antes de armar el paquete
+volatile float         ultrasonico_distancia = 0;
+volatile unsigned long ultrasonico_echoStart = 0;
+volatile unsigned long ultrasonico_echoEndTime = 0;
+
+// Añade estas dos líneas junto al resto de globales
+SemaphoreHandle_t semRespuesta;
+
+// NUEVO: Variable volatil para registrar el tiempo exacto de recepcion de red
+volatile unsigned long T2_capturado = 0; 
+
+// ============================================================
+void ActualizarPWM(uint8_t pwmPin, uint32_t Periodo, uint32_t* Periodo_ant, uint32_t Pulso)
+{
+  if ((Periodo > 1000) & (Periodo < 100000) & (Pulso < Periodo))
   {
-    Serial.println("Mensaje de MAC no autorizada, ignorado.");
-    return;
+    if ((Periodo > *Periodo_ant + 100) | (Periodo < *Periodo_ant - 100))
+    {
+      uint32_t frec = 1E6 / Periodo;
+      ledcDetach(pwmPin);
+      ledcAttach(pwmPin, frec, resolucion);
+      *Periodo_ant = Periodo;
+    }
+    uint32_t Ciclotrabajo = (max_valor * Pulso) / Periodo;
+    ledcWrite(pwmPin, Ciclotrabajo);
   }
-
-  if (len != sizeof(ControlPacket)) 
-  {
-    Serial.println("Tamaño de paquete incorrecto");
-    return;
-  }
-
-  const uint32_t tc0 = micros();
-  ControlPacket received;
-  memcpy(&received, incomingData, sizeof(received));
-  st_add(st_cb_copy, micros() - tc0);
-
-  // Actualizar tiempo de última comunicación válida
-  lastCommTime = millis();
-
-  //Actualizar señales PWM de control
-  const uint32_t tp0 = lastCommTime;
-  ActualizarPWM(MOTORdd, received.Period_dd, &Periodo_ant[0], received.Pulso_dd);
-  ActualizarPWM(MOTORdi, received.Period_di, &Periodo_ant[1], received.Pulso_di);
-  ActualizarPWM(MOTORtd, received.Period_td, &Periodo_ant[2], received.Pulso_td);
-  ActualizarPWM(MOTORti, received.Period_ti, &Periodo_ant[3], received.Pulso_ti);
-  st_add(st_cb_pwm, micros() - tp0);
-
-  // Responder con un mensaje inmediato con las medidas de los sensores en el drone
-  const uint32_t ts0 = micros();
-  data_sensores.ax = AcX_filtr;
-  data_sensores.ay = AcY_filtr;
-  data_sensores.az = AcZ_filtr;
-  data_sensores.gx = GX_filtr;
-  data_sensores.gy = GY_filtr;
-  data_sensores.gz = GZ_filtr;
-  data_sensores.tmp = Tmp_filtr;
-  data_sensores.estado = true;
-  st_add(st_cb_sensor, micros() - ts0);
-
-  const uint32_t te0 = micros();
-  esp_err_t result = esp_now_send(master_mac, (uint8_t *)&data_sensores, sizeof(data_sensores));
-  st_add(st_cb_send, micros() - te0);
-  st_add(st_cb_total, micros() - t0);
-  cb_dirty = true;
-
-  #if SLAVE_CB_PRINTS
-    Serial.printf("Distancia: %.2f   ",  data_sensores.Dist_ultrasonicos);
-    Serial.printf("AcYfiltr: %.2f   ", AcY_filtr);
-    Serial.printf("Actualiza PWMdd: %d ",  received.Pulso_dd);
-    Serial.printf(" Tiempo: %d \n", millis());
-  #endif
-
-  if (result != ESP_OK)
-    Serial.println("Error al enviar respuesta");
+  else ledcWrite(pwmPin, 0);
 }
 
-//Interrupción del sensor de ultrasonidos
-void IRAM_ATTR Ultrasnd_PWM_int() 
+void tareaRespuesta(void *pvParameters)
+{
+  for (;;) 
+  {
+    // La tarea se queda "dormida" aquí hasta que OnDataRecv avise
+    if (xSemaphoreTake(semRespuesta, portMAX_DELAY) == pdTRUE) 
+    {
+      // ARMAR PAQUETE
+      // Tomamos la información fresca que el loop() ha ido guardando
+      data_sensores.Dist_ultrasonicos = ultrasonico_distancia;
+      data_sensores.echoStartTime     = ultrasonico_echoStart;
+      data_sensores.echoEndTime       = ultrasonico_echoEndTime;
+      
+      data_sensores.ax = AcX_filtr;
+      data_sensores.ay = AcY_filtr;
+      data_sensores.az = AcZ_filtr;
+      data_sensores.gx = GX_filtr;
+      data_sensores.gy = GY_filtr;
+      data_sensores.gz = GZ_filtr;
+      data_sensores.estado = true;
+
+      // Control del Sentinel para el test de latencia
+      if (stepActivo) 
+      {
+        if (esperandoRespuesta && T1_latencia == 0) T1_latencia = micros();
+        data_sensores.tmp = SENTINEL_TMP_VALUE;
+      } 
+      else data_sensores.tmp = (int16_t)Tmp_filtr;
+
+      // enviamos
+      esp_now_send(master_mac, (uint8_t *)&data_sensores, sizeof(data_sensores));
+    }
+  }
+}
+
+// ============================================================
+// OnDataRecv LIMPIO: Solo valida, copia datos y levanta bandera
+// ============================================================
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len)
+{
+  if (memcmp(info->src_addr, master_mac, 6) != 0) return;
+  if (len != sizeof(ControlPacket)) return;
+
+  T2_capturado = micros();
+  memcpy(&paqueteRecibido, incomingData, sizeof(ControlPacket));
+  lastCommTime = millis();
+  nuevoPaquete = true; // paquete con nuevos PWM
+  xSemaphoreGive(semRespuesta);  // Despertar a la Tarea FreeRTOS al instante
+}
+
+// ============================================================
+void IRAM_ATTR Ultrasnd_PWM_int()
 {
   unsigned long now = micros();
-  
-  
   switch (Estado_ultrsnd)
   {
-    case ECHO_START:   // Paso 2: Esperar a que ECHO pase a HIGH
-      if (digitalRead(ECHO_PIN) == HIGH) 
+    case ECHO_START:
+      if (digitalRead(ECHO_PIN) == HIGH)
       {
-        echoStartTime = now - lastTriggerTime;
-        Estado_ultrsnd = ECHO_END;  //Espera finalizado pulso en ECHO
+        echoStartTime  = now - lastTriggerTime;
+        Estado_ultrsnd = ECHO_END;
       }
-      else
-       if(now - lastTriggerTime > 1000)   //No Detecta pulso ECHO. Toma medida anterior
-       {
-        Estado_ultrsnd = INICIAL;
-       }
-       break;
+      else if (now - lastTriggerTime > 1000) Estado_ultrsnd = INICIAL;
+      break;
 
-    case ECHO_END: // Paso 3: Esperar a que ECHO pase a LOW
+    case ECHO_END:
       Estado_ultrsnd = INICIAL;
-      if (digitalRead(ECHO_PIN) == LOW) 
-      {     
-        if (now-lastTriggerTime<3000)   //Máxima distancia 1m
-          echoEndTime = now-lastTriggerTime-echoStartTime;
-        else
-        {
-         echoStartTime = 100;
-         echoEndTime = 2800;
-        } 
-        // Paso 4: Calcular duración y distancia
-        data_sensores.Dist_ultrasonicos = echoEndTime * 0.0343 / 2.0;
-        data_sensores.echoStartTime = echoStartTime;
-        data_sensores.echoEndTime = echoEndTime;
+      if (digitalRead(ECHO_PIN) == LOW)
+      {
+        nuevaMedida = true;
+        if (now - lastTriggerTime < 3000) echoEndTime = now - lastTriggerTime - echoStartTime;
+        else { echoStartTime = 100;
+        echoEndTime = 2800; }
       }
       break;
-    default:
-      Estado_ultrsnd=INICIAL;
+
+    default: Estado_ultrsnd = INICIAL;
   }
 }
 
-
-
-void setup() 
+// ============================================================
+void setup()
 {
-//Configuración puerto serie
+  // Primero el semáforo, luego la tarea
+  semRespuesta = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCore
+  (
+    tareaRespuesta,   // función
+    "resp",           // nombre
+    4096,             // stack bytes
+    NULL,             // parámetro
+    10,               // prioridad (> Arduino loop que va a 1)
+    NULL,             // handle (no lo necesitamos)
+    1                 // Core 1 — mismo que Arduino loop, prioridad mayor
+  );
+
   Serial.begin(115200);
 
-//Configuración Sensor ultrasonico
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  digitalWrite(TRIG_PIN, LOW);  // Asegura que TRIG comience en LOW
+  digitalWrite(TRIG_PIN, LOW);
   attachInterrupt(ECHO_PIN, Ultrasnd_PWM_int, CHANGE);
-//Configurciones pins pruebas
+
   pinMode(PRUEBA_PIN, OUTPUT);
-  
-//Configura puertos PWM
-  //ledcAttach(MOTORdd, 50, 10);
-  ledcAttachChannel(MOTORdd, 50, 10, 0);
-  ledcWrite(MOTORdd, 0);
 
-  //ledcAttach(MOTORdi, 50, 10);
-  ledcAttachChannel(MOTORdi, 50, 10, 1);
-  ledcWrite(MOTORdi, 0);
-
-  //ledcAttach(MOTORtd, 50, 10);
-  ledcAttachChannel(MOTORtd, 50, 10, 2);
-  ledcWrite(MOTORtd, 0);
-
-  //ledcAttach(MOTORti, 50, 10);
-  ledcAttachChannel(MOTORti, 50, 10, 3);
-  ledcWrite(MOTORti, 0);
-
-
-//Arma ESC
-
-  ledcWrite(MOTORdd, 0.05*max_valor);
-  ledcWrite(MOTORdi, 0.05*max_valor);
-  ledcWrite(MOTORtd, 0.05*max_valor);
-  ledcWrite(MOTORti, 0.05*max_valor);
+  ledcAttachChannel(MOTORdd, 50, 10, 0); ledcWrite(MOTORdd, 0);
+  ledcAttachChannel(MOTORdi, 50, 10, 1); ledcWrite(MOTORdi, 0);
+  ledcAttachChannel(MOTORtd, 50, 10, 2); ledcWrite(MOTORtd, 0);
+  ledcAttachChannel(MOTORti, 50, 10, 3); ledcWrite(MOTORti, 0);
+  ledcWrite(MOTORdd, 0.05 * max_valor);
+  ledcWrite(MOTORdi, 0.05 * max_valor);
+  ledcWrite(MOTORtd, 0.05 * max_valor);
+  ledcWrite(MOTORti, 0.05 * max_valor);
   delay(3000);
 
-//Configuración comunicación ESP32 Now
+  esp_log_level_set("*", ESP_LOG_NONE);  // elimina ~1-2ms de jitter del driver WiFi
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
+  if (esp_now_init() != ESP_OK) { Serial.println("Error ESP-NOW"); return; }
 
-  if (esp_now_init() != ESP_OK) 
-  {
-    Serial.println("Error al inicializar ESP-NOW");
-    return;
-  }
-
-  // Registrar callback actualizado
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Registrar al master como peer válido
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, master_mac, 6);
-  peerInfo.channel = 0;  
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
-
-  if (!esp_now_is_peer_exist(master_mac)) 
-  {
+  if (!esp_now_is_peer_exist(master_mac))
     if (esp_now_add_peer(&peerInfo) != ESP_OK) 
-    {
-      Serial.println("Error al registrar al master");
-      return;
+    { 
+      Serial.println("Error peer"); return;
     }
-  }
 
   Serial.println("Slave listo. Esperando mensajes del master...");
+  Serial.println(F("MODO: Midiendo tiempo desde SLAVE (envia tmp = 30000)"));
 
-  //*********Configurar I2C para IMU**************
   Wire.begin();
-  Wire.setClock(400000); 
+  Wire.setClock(400000);
   Wire.beginTransmission(MPU_addr);
-  Wire.write(0x6B);  // PWR_MGMT_1 register
-  Wire.write(0);     // set to zero (wakes up the MPU-6050)
+  Wire.write(0x6B);
+  Wire.write(0);
   Wire.endTransmission(true);
 }
 
-void loop() 
+// ============================================================
+void loop()
 {
 
-//****************ESTADO DEL SENSOR ULTRASONICO****************************
-  // Paso 1: Enviar pulso TRIG cada 20 ms
-  if ((Estado_ultrsnd == INICIAL) && millis() - lastTriggerTime >= PeriodMedUltrsn) 
-  {    
+  // ---- PROCESAMIENTO DE PAQUETE RECIBIDO (Movido desde OnDataRecv) ----
+  if (nuevoPaquete)
+  {
+    nuevoPaquete = false; // Resetear la bandera inmediatamente
+
+    // ----------------------------------------------------------
+    // DETECCION DE RESPUESTA DE ALUMNO (SALTO PWM)
+    // ----------------------------------------------------------
+    if (!baselineInicializado && paqueteRecibido.Pulso_dd > 0)
+    {
+      pwmBaseline          = paqueteRecibido.Pulso_dd;
+      baselineInicializado = true;
+      Serial.printf("Baseline inicializado: %d us\n", pwmBaseline);
+    }
+    else if (baselineInicializado)
+    {
+      int16_t diff = paqueteRecibido.Pulso_dd - pwmBaseline;
+      if (diff > UMBRAL_PWM_CAMBIO)
+      {
+        // Detectamos que el PWM subió porque el Alumno rebotó el tmp
+        if (esperandoRespuesta)
+        {
+          unsigned long T2 = T2_capturado; // Usamos el tiempo exacto capturado en OnDataRecv
+          uint32_t latencia_us = (uint32_t)(T2 - T1_latencia);
+          esperandoRespuesta = false;
+
+          if (latencia_us < lat_min) lat_min = latencia_us;
+          if (latencia_us > lat_max) lat_max = latencia_us;
+          lat_suma  += latencia_us;
+          lat_count++;
+
+          Serial.printf("Resultado #%lu\n", lat_count);
+          Serial.printf("PWM: %d us (diff=+%d us)\n", 
+                        (int)paqueteRecibido.Pulso_dd, (int)diff);
+          Serial.printf("   Round-trip: %lu ms (%lu us)\n", latencia_us/1000, latencia_us);
+          Serial.printf("   Min: %lu ms | Max: %lu ms | Media: %lu ms\n",
+                        lat_min/1000, lat_max/1000, (lat_count > 0) ? (lat_suma / lat_count / 1000) : 0);
+          Serial.println();
+        }
+        pwmBaseline = paqueteRecibido.Pulso_dd; // Actualizamos a la nueva altura
+      }
+      else if (diff < -UMBRAL_PWM_CAMBIO)
+      {
+        // El PWM ha vuelto a bajar al valor base
+        pwmBaseline = paqueteRecibido.Pulso_dd;
+      }
+    }
+
+    // Aplicar PWM a los ESC
+    ActualizarPWM(MOTORdd, paqueteRecibido.Period_dd, &Periodo_ant[0], paqueteRecibido.Pulso_dd);
+    ActualizarPWM(MOTORdi, paqueteRecibido.Period_di, &Periodo_ant[1], paqueteRecibido.Pulso_di);
+    ActualizarPWM(MOTORtd, paqueteRecibido.Period_td, &Periodo_ant[2], paqueteRecibido.Pulso_td);
+    ActualizarPWM(MOTORti, paqueteRecibido.Period_ti, &Periodo_ant[3], paqueteRecibido.Pulso_ti);
+  }
+
+  // ---- Sensor ultrasonico ----
+  if ((Estado_ultrsnd == INICIAL) && (micros() - lastTriggerTime >= PeriodMedUltrsn))
+  {
     digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(20);  //Pulso de 20us
+    delayMicroseconds(20);
     digitalWrite(TRIG_PIN, LOW);
     lastTriggerTime = micros();
-    Estado_ultrsnd = ECHO_START;      //Espera señal ECHO
+    Estado_ultrsnd  = ECHO_START;
   }
 
-
-  //**************Control de motores*******************
-  //Desactivar si se ha perdido comunicaciones con el Master********
-  if (millis() - lastCommTime > commTimeout) 
+  if (nuevaMedida)
   {
-    // Apagar PWM de todos los motores
-    ledcWrite(MOTORdd, 0.045*max_valor);
-    ledcWrite(MOTORdi, 0.045*max_valor);
-    ledcWrite(MOTORtd, 0.045*max_valor);
-    ledcWrite(MOTORti, 0.045*max_valor);
-    Serial.println("Sin comunicaciones");
+    nuevaMedida = false;
+    // El loop "añade la info" a las variables seguras
+    ultrasonico_echoStart   = echoStartTime;
+    ultrasonico_echoEndTime = echoEndTime;
+    ultrasonico_distancia   = echoEndTime * 0.0343f / 2.0f;
   }
 
-  
-  //Nueva medida de la IMU
-  if (millis() - LastMedIMU > PeriodMedIMU) 
+  // ---- IMU ----
+  if (millis() - LastMedIMU > PeriodMedIMU)
   {
-  Wire.beginTransmission(MPU_addr);
-  Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_addr, 14, true);  // request a total of 14 registers
-  AcX = Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
-  AcY = Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  AcZ = Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-  Tmp = Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-  GX = Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-  GY = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-  GZ = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+    Wire.beginTransmission(MPU_addr);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_addr, 14, true);
+    AcX = Wire.read() << 8 | Wire.read();
+    AcY = Wire.read() << 8 | Wire.read();
+    AcZ = Wire.read() << 8 | Wire.read();
+    Tmp = Wire.read() << 8 | Wire.read();
+    GX  = Wire.read() << 8 | Wire.read();
+    GY  = Wire.read() << 8 | Wire.read();
+    GZ  = Wire.read() << 8 | Wire.read();
 
-  AcX_filtr = AcX_filtr*alpha+AcX*(1-alpha);
-  AcY_filtr = AcY_filtr*alpha+AcY*(1-alpha);
-  AcZ_filtr = AcZ_filtr*alpha+AcZ*(1-alpha);
-  
-  Tmp_filtr = Tmp_filtr*alpha+Tmp*(1-alpha);
-  
-  GX_filtr = GX_filtr*alpha+GX*(1-alpha);
-  GY_filtr = GY_filtr*alpha+GY*(1-alpha);
-  GZ_filtr = GZ_filtr*alpha+GZ*(1-alpha);
-
-  LastMedIMU = millis();
+    AcX_filtr = AcX_filtr * alpha + AcX * (1 - alpha);
+    AcY_filtr = AcY_filtr * alpha + AcY * (1 - alpha);
+    AcZ_filtr = AcZ_filtr * alpha + AcZ * (1 - alpha);
+    Tmp_filtr = Tmp_filtr * alpha + Tmp * (1 - alpha);
+    GX_filtr  = GX_filtr  * alpha + GX  * (1 - alpha);
+    GY_filtr  = GY_filtr  * alpha + GY  * (1 - alpha);
+    GZ_filtr  = GZ_filtr  * alpha + GZ  * (1 - alpha);
+    inclinacion = (atan2f(AcY_filtr, -AcZ_filtr)) * 180.0f / PI;
+    LastMedIMU  = millis();
   }
 
-  // === REPORTE de métricas cada 1000 ms ===
-  static uint32_t rep_ms = 0;
-  if ((uint32_t)(millis() - rep_ms) >= 1000) 
+  // ---- GENERADOR DE ESCALON (SLAVE MIDE TIEMPO) ----
+  unsigned long ahoraMs = millis();
+  // --- TIEMPO DE CORTESÍA (EJ: 8000 ms) ---
+  if (ahoraMs < 8000) 
   {
-    rep_ms = millis();
-
-    if (cb_dirty) 
+    lastStepMs = ahoraMs;
+  }
+  else
+  {
+    // Pasados los 8 segundos, arranca el test normalmente
+    if (ahoraMs - lastStepMs >= LATENCY_STEP_MS)
     {
-      Serial.println("=== SLAVE OnDataRecv stats (1s) ===");
-      Serial.printf("total: n=%lu avg=%luus max=%luus\n", (unsigned long)st_cb_total.n, (unsigned long)st_avg(st_cb_total), (unsigned long)st_cb_total.max_us);
-      Serial.printf("copy : n=%lu avg=%luus max=%luus\n",  (unsigned long)st_cb_copy.n,  (unsigned long)st_avg(st_cb_copy),  (unsigned long)st_cb_copy.max_us);
-      Serial.printf("pwm  : n=%lu avg=%luus max=%luus | recfg=%lu\n",
-        (unsigned long)st_cb_pwm.n, (unsigned long)st_avg(st_cb_pwm), (unsigned long)st_cb_pwm.max_us,
-        (unsigned long)pwm_recfg_count);
-      Serial.printf("sens : n=%lu avg=%luus max=%luus\n",  (unsigned long)st_cb_sensor.n,(unsigned long)st_avg(st_cb_sensor),(unsigned long)st_cb_sensor.max_us);
-      Serial.printf("send : n=%lu avg=%luus max=%luus\n",  (unsigned long)st_cb_send.n, (unsigned long)st_avg(st_cb_send),  (unsigned long)st_cb_send.max_us);
+      lastStepMs = ahoraMs;
+      stepActivo = !stepActivo;
 
-      st_reset(st_cb_total); st_reset(st_cb_copy); st_reset(st_cb_pwm); st_reset(st_cb_sensor); st_reset(st_cb_send);
-      pwm_recfg_count = 0;
-      cb_dirty = false;
+      if (stepActivo)
+      {
+        T1_latencia = 0;
+        esperandoRespuesta = true;
+
+        Serial.println(" >>> ESCALON ENVIADO");
+      }
+    }
+
+    // Timeout: si en 1 segundo no llega respuesta PWM, resetear
+    if (esperandoRespuesta && T1_latencia > 0 && (micros() - T1_latencia > 1000000UL)) // guard para T1 no inicializado
+    {
+      esperandoRespuesta = false;
+      Serial.println("TIMEOUT - PWM no cambio en 1s");
     }
   }
 
+  // ---- Timeout comunicaciones ----
+  if (millis() - lastCommTime > commTimeout)
+  {
+    ledcWrite(MOTORdd, 0.045 * max_valor);
+    ledcWrite(MOTORdi, 0.045 * max_valor);
+    ledcWrite(MOTORtd, 0.045 * max_valor);
+    ledcWrite(MOTORti, 0.045 * max_valor);
+    // Rate-limit: solo imprime una vez por 1000ms
+    static unsigned long lastWarnMs = 0;
+    if (millis() - lastWarnMs >= 1000) 
+    {
+      Serial.println("Sin comunicaciones");
+      lastWarnMs = millis();
+    }
+  }
 }
