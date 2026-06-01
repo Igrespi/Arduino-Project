@@ -1,178 +1,191 @@
 #include <Servo.h>
-#include<Wire.h>
+#include <Wire.h>
 
-// ================= PROFILER SIMPLE (Arduino IDE friendly) =================
-typedef struct 
-{
-  uint32_t n;
-  uint32_t sum_us;
-  uint32_t max_us;
-} Stats;
+// ============================================================
+//  SISTEMA DE ESTADÍSTICAS
+// ============================================================
+#define STATS_INTERVAL_MSA 4000
+#define STATS_INTERVAL_MSB 2000
+#define STATS_GUARD_MS 200
 
-static inline void stats_reset(Stats &s) { s.n = 0; s.sum_us = 0; s.max_us = 0; }
-static inline void stats_add(Stats &s, uint32_t dt_us) 
+uint32_t st_loopMaxUs   = 0;
+uint32_t st_loopMinUs   = UINT32_MAX;
+
+uint32_t st_imuPeriodMaxUs  = 0;
+uint32_t st_imuPeriodMinUs  = UINT32_MAX;
+unsigned long st_imuLastUs  = 0;
+uint32_t st_imuWorkMaxUs  = 0;
+uint32_t st_imuWorkMinUs  = UINT32_MAX;
+
+uint32_t st_ultraPeriodMaxUs = 0;
+uint32_t st_ultraPeriodMinUs = UINT32_MAX;
+unsigned long st_ultraLastUs = 0;
+uint32_t st_ultraWorkMaxUs  = 0;
+uint32_t st_ultraWorkMinUs  = UINT32_MAX;
+
+uint32_t st_ctrlPeriodMaxUs  = 0;
+uint32_t st_ctrlPeriodMinUs  = UINT32_MAX;
+unsigned long st_ctrlLastUs  = 0;
+uint32_t st_ctrlWorkMaxUs  = 0;
+uint32_t st_ctrlWorkMinUs  = UINT32_MAX;
+
+uint32_t st_motorPeriodMaxUs = 0;
+uint32_t st_motorPeriodMinUs = UINT32_MAX;
+unsigned long st_motorLastUs = 0;
+uint32_t st_motorWorkMaxUs  = 0;
+uint32_t st_motorWorkMinUs  = UINT32_MAX;
+
+unsigned long statsLastPrintMsA = 0;
+unsigned long statsLastPrintMsB = 0;
+
+void resetStatsA()
 {
-  s.n++;
-  s.sum_us += dt_us;
-  if (dt_us > s.max_us) s.max_us = dt_us;
+  st_imuPeriodMaxUs = st_ultraPeriodMaxUs = st_ctrlPeriodMaxUs = st_motorPeriodMaxUs = 0;
+  st_imuPeriodMinUs = st_ultraPeriodMinUs = st_ctrlPeriodMinUs = st_motorPeriodMinUs = UINT32_MAX;
 }
-static inline uint32_t stats_avg(const Stats &s) { return s.n ? (s.sum_us / s.n) : 0; }
 
-// Métricas por evento (duración)
-static Stats stLoop, stIMU, stUltraTrig, stCtrl, stPWMTarget, stEscUpdate;
-// Métricas por evento (periodo real entre ejecuciones)
-static Stats stIMU_Per, stUltra_Per, stCtrl_Per, stEsc_Per;
+void resetStatsB()
+{
+  st_loopMaxUs  = st_imuWorkMaxUs = st_ultraWorkMaxUs = st_ctrlWorkMaxUs = st_motorWorkMaxUs = 0;
+  st_loopMinUs  = st_imuWorkMinUs = st_ultraWorkMinUs = st_ctrlWorkMinUs = st_motorWorkMinUs = UINT32_MAX;
+}
 
-// Timestamps de última ejecución (para periodos)
-static uint32_t lastIMU_us = 0, lastUltra_us = 0, lastCtrl_us = 0, lastEsc_us = 0;
+void printStatsA()
+{
+  Serial.print(F("A| IMU: "));      Serial.print(st_imuPeriodMinUs);
+  Serial.print(F(" / ")); Serial.print(st_imuPeriodMaxUs);   Serial.print(F(" us | "));
+  Serial.print(F("Ultra: "));       Serial.print(st_ultraPeriodMinUs); Serial.print(F(" / ")); Serial.print(st_ultraPeriodMaxUs); Serial.print(F(" us | "));
+  Serial.print(F("PID: "));         Serial.print(st_ctrlPeriodMinUs);  Serial.print(F(" / ")); Serial.print(st_ctrlPeriodMaxUs);  Serial.print(F(" us | "));
+  Serial.print(F("Motor: "));       Serial.print(st_motorPeriodMinUs); Serial.print(F(" / ")); Serial.print(st_motorPeriodMaxUs); Serial.println(F(" us"));
+}
 
-// Contadores de overrun (cuántas veces tardó demasiado)
-static uint32_t ovCtrl = 0, ovIMU = 0;
+void printStatsB()
+{
+  Serial.print(F("B| Loop: "));     Serial.print(st_loopMinUs);    Serial.print(F(" / ")); Serial.print(st_loopMaxUs);    Serial.print(F(" us | "));
+  Serial.print(F("IMU: "));         Serial.print(st_imuWorkMinUs);
+  Serial.print(F(" / ")); Serial.print(st_imuWorkMaxUs); Serial.print(F(" us | "));
+  Serial.print(F("Ultra: "));       Serial.print(st_ultraWorkMinUs); Serial.print(F(" / ")); Serial.print(st_ultraWorkMaxUs); Serial.print(F(" us | "));
+  Serial.print(F("PID: "));         Serial.print(st_ctrlWorkMinUs); Serial.print(F(" / ")); Serial.print(st_ctrlWorkMaxUs); Serial.print(F(" us | "));
+  Serial.print(F("Motor: "));       Serial.print(st_motorWorkMinUs); Serial.print(F(" / ")); Serial.print(st_motorWorkMaxUs); Serial.println(F(" us"));
+}
 
-// Debug: desactiva prints en camino crítico
-#define DEBUG_CONTROL_PRINTS 0
+// ============================================================
+//  TEST DE LATENCIA
+//  Funcionamiento:
+//    - Slave envia IMU.tmp = SENTINEL_TMP periodicamente
+//    - Alumno lee ese valor y cambia su PWM al escalon alto
+//    - Slave detecta el cambio de PWM y calcula la latencia
+// ============================================================
+#define SENTINEL_TMP        30000    // valor de tmp imposible en condiciones normales
+#define PWM_BASE_PCT        25.0f    // PWM base durante el test (%)
+#define PWM_STEP_PCT        50.0f    // PWM del escalon alto (%)
 
-//**********Definiciones control***************
-#define Periodo_Ctrl 20000  //Periodo en microsegundos
-#define Periodo_Actlz  10000
-unsigned long LastCtrl;
-unsigned long LastActlz;
-float Ref_incl = 0; //Magnitud comparada con ay
-float Ref_altura = 35.0; //Altura en cm
-float Consgn_motor_ascnd = 0;   //()
-float Consgn_motor_incl = 0;   //()
-float Integral_asc = 0;
-float Integral_incl = 0;
-float Error_alt_ant;
-float Error_incl_ant;
+bool modoTestLatencia = true; // true = test activo, false = PID normal
+
+// ============================================================
+#define OSC_PIN 9
+
+#define Periodo_Ctrl   10000 // 20000
+#define Periodo_Actlz  5000 // 10000
+unsigned long LastCtrl  = 0;
+unsigned long LastActlz = 0;
+
+float Ref_incl           = 0;
+float Ref_altura         = 20.0f;
+float Consgn_motor_ascnd = 0;
+float Consgn_motor_incl  = 0;
+float Integral_asc       = 0;
+float Integral_incl      = 0;
+float Error_alt_ant      = 0;
+float Error_incl_ant     = 0;
 
 #define Ref_dd 0
 #define Ref_di 1
 #define Ref_td 2
 #define Ref_ti 3
-#define KI_asc 0.5
-#define KP_asc 6
-#define KD_asc 3
-#define KI_incl 0.6 //0.2
-#define KP_incl 5
-#define KD_incl 500000.
 
-#define Max_Consg_motor 70
-#define Min_Consg_motor 20
+#define KI_asc   0.5f
+#define KP_asc   6.0f
+#define KD_asc   3.0f
+#define KI_incl  0.6f
+#define KP_incl  5.0f
+#define KD_incl  500000.0f
 
-float throttleTargetPct[] = {0,0,0,0};
-float throttleCurrentPct[] = {0,0,0,0};
-unsigned long lastUpdateMs[] = {0,0,0,0};
+#define Max_Consg_motor  70
+#define Min_Consg_motor  20
 
-//***********Definiciones ultrasonidos**************
-#define TRIG_PIN 10
-#define ECHO_PIN 11
-#define MAX_DISTANCE 100 // en cm
-#define PeriodMedUltsnd 15000 //Periodo en microsegundos
+float throttleTargetPct[]  = {0, 0, 0, 0};
+float throttleCurrentPct[] = {0, 0, 0, 0};
+unsigned long lastUpdateMs[] = {0, 0, 0, 0};
+
+#define TRIG_PIN        10
+#define ECHO_PIN        11
+#define PeriodMedUltsnd 15000 // 20000
 unsigned long lastTriggerTime = 0;
-unsigned long echoStartTime = 0;
-unsigned long echoEndTime = 0;
-float Dist_ultrasonicos;
+unsigned long echoStartTime   = 0;
+unsigned long echoEndTime     = 0;
+volatile bool nuevaMedidaUltrasonido = false;
+float Dist_ultrasonicos       = 0;
 
-enum EstadosUltrsnd 
-{
-  INICIAL,
-  PULSO_TRIGGER,
-  ECHO_START,
-  ECHO_END
-};
+enum EstadosUltrsnd { INICIAL, PULSO_TRIGGER, ECHO_START, ECHO_END };
 EstadosUltrsnd Estado_ultrsnd = INICIAL;
-volatile unsigned int distance = 0; // variable actualizada en la interrupción
 
-//Interrupción del sensor de ultrasonidos
-void  Ultrasnd_PWM_int() 
+void Ultrasnd_PWM_int()
 {
   unsigned long now = micros();
-  
   switch (Estado_ultrsnd)
   {
-    case ECHO_START:  // Paso 2: Esperar a que ECHO pase a HIGH
-      if (digitalRead(ECHO_PIN) == HIGH) 
+    case ECHO_START:
+      if (digitalRead(ECHO_PIN) == HIGH)
       {
-        echoStartTime = now - lastTriggerTime;
-        Estado_ultrsnd = ECHO_END; //Espera finalizado pulso en ECHO
+        echoStartTime  = now - lastTriggerTime;
+        Estado_ultrsnd = ECHO_END;
       }
-      else
-      if (now - lastTriggerTime > 1000)   //No Detecta pulso ECHO. Toma medida anterior
-       {
-        Estado_ultrsnd = INICIAL;
-       }
-       break;
+      else if (now - lastTriggerTime > 1000) Estado_ultrsnd = INICIAL;
+      break;
 
-    case ECHO_END: // Paso 3: Esperar a que ECHO pase a LOW
+    case ECHO_END:
       Estado_ultrsnd = INICIAL;
-      if (digitalRead(ECHO_PIN) == LOW) 
-      {  
-        if (now - lastTriggerTime < 3000)  //Máxima distancia 1m
-          echoEndTime = now - lastTriggerTime - echoStartTime;
-        else
-        {
-         echoStartTime = 100;
-         echoEndTime = 2800;
-        } 
-        // Paso 4: Calcular duración y distancia
-        Dist_ultrasonicos = echoEndTime * 0.0343 / 2.0;
-        echoStartTime = echoStartTime;
-        echoEndTime = echoEndTime;
+      if (digitalRead(ECHO_PIN) == LOW)
+      {
+        if (now - lastTriggerTime < 3000) echoEndTime = now - lastTriggerTime - echoStartTime;
+        else { echoStartTime = 100; echoEndTime = 2800; }
+        nuevaMedidaUltrasonido = true; // Añade una bandera booleana (volatile bool)
       }
       break;
+
     default: Estado_ultrsnd = INICIAL;
   }
 }
 
+Servo esc_dd, esc_di, esc_td, esc_ti;
+const int PIN_ESCdd  = 6;
+const int PIN_ESCdi  = 5;
+const int PIN_ESCtd  = 4;
+const int PIN_ESCti  = 3;
 
-//*************Definiciones control ESC*****************
-Servo esc_dd;
-Servo esc_di;
-Servo esc_td;
-Servo esc_ti;
+const int US_MIN     = 1000;
+const int US_MAX     = 2000;
+const int STARTUP_MS = 6000;
+const float SLEW_PCT_PER_S = 2000.0f;
 
-// ==== AJUSTA A TU ESC ====
-const int PIN_ESCdd = 6;  // pin de señal hacia el ESC
-const int PIN_ESCdi = 5;
-const int PIN_ESCtd = 4;
-const int PIN_ESCti = 3;
-
-
-const int US_MIN = 1000;    // mínimo (idle/parado). Muchos ESC: 1000 µs
-const int US_MAX = 2000;    // máximo (full throttle). Muchos ESC: 2000 µs
-const int US_ARM = US_MIN;  // pulso para armar (normalmente el mínimo)
-const int STARTUP_MS = 6000;   // tiempo de espera inicial para que el ESC “pite” y se inicie
-// ==========================
-
-// limitador de rampa (porcentaje por segundo)
-const float SLEW_PCT_PER_S = 2000.0;  
-
-
-// Mapea 0..100% -> microsegundos (US_MIN..US_MAX)
-int pctToMicros(float pct) 
+int pctToMicros(float pct)
 {
   pct = constrain(pct, 0.0f, 100.0f);
   return (int)(US_MIN + (US_MAX - US_MIN) * (pct / 100.0f));
 }
 
-
-// Cambia objetivo de gas en %
-void setThrottlePercent(float pct, unsigned int Motor) 
+void setThrottlePercent(float pct, unsigned int Motor)
 {
   throttleTargetPct[Motor] = constrain(pct, 0.0f, 100.0f);
-  lastUpdateMs[Motor] = millis();
+  lastUpdateMs[Motor]      = millis();
 }
 
-
-// Aplica rampa y escribe al ESC
-void updateThrottle(Servo esc, unsigned int Motor) 
+void updateThrottle(Servo esc, unsigned int Motor)
 {
   unsigned long now = millis();
   float dt = (now - lastUpdateMs[Motor]) / 1000.0f;
   lastUpdateMs[Motor] = now;
-
-  // calcular cambio máximo permitido por rampa
   float maxStep = SLEW_PCT_PER_S * dt;
 
   if (throttleCurrentPct[Motor] < throttleTargetPct[Motor])
@@ -183,271 +196,253 @@ void updateThrottle(Servo esc, unsigned int Motor)
   esc.writeMicroseconds(pctToMicros(throttleCurrentPct[Motor]));
 }
 
+const int MPU_addr   = 0x68;
+unsigned long LastMedIMU = 0;
+#define PeriodMedIMU 2000 // 7500
 
-
-//*************Definiciones IMU****************************
-const int MPU_addr = 0x68;  // I2C address of the MPU-6050
-int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
-unsigned long LastMedIMU;
-#define PeriodMedIMU  15000  //microsegundos entre medidas de la IMU
-
-typedef struct __attribute__((packed)) 
-{
-  //IMU ACELERÓMETRO
-  int16_t ax;
-  int16_t ay;
-  int16_t az;
-  //IMU temperatura:
-  int16_t tmp;
-  //IMU GIROSCOPIO
-  int16_t gx;
-  int16_t gy;
-  int16_t gz;
+typedef struct __attribute__((packed)) { int16_t ax, ay, az, tmp, gx, gy, gz;
 } Sensor_IMU;
-
 Sensor_IMU IMU;
 
-
-
-
-//**********************************************************
-void setup() 
+// ============================================================
+void setup()
 {
-  //Configuración puerto serie
   Serial.begin(115200);
 
-  //**************Configuración control ESC******************  
-  pinMode(PIN_ESCdd, OUTPUT);
-  digitalWrite(PIN_ESCdd, HIGH);
+  pinMode(OSC_PIN, OUTPUT);
+  digitalWrite(OSC_PIN, LOW);
 
-  pinMode(PIN_ESCdi, OUTPUT);
-  digitalWrite(PIN_ESCdi, HIGH);
-
-  pinMode(PIN_ESCtd, OUTPUT);
-  digitalWrite(PIN_ESCtd, HIGH);
-
-  pinMode(PIN_ESCti, OUTPUT);
-  digitalWrite(PIN_ESCti, HIGH);
+  pinMode(PIN_ESCdd, OUTPUT); digitalWrite(PIN_ESCdd, HIGH);
+  pinMode(PIN_ESCdi, OUTPUT); digitalWrite(PIN_ESCdi, HIGH);
+  pinMode(PIN_ESCtd, OUTPUT); digitalWrite(PIN_ESCtd, HIGH);
+  pinMode(PIN_ESCti, OUTPUT); digitalWrite(PIN_ESCti, HIGH);
 
   esc_dd.attach(PIN_ESCdd, US_MIN, US_MAX);
   esc_di.attach(PIN_ESCdi, US_MIN, US_MAX);
   esc_td.attach(PIN_ESCtd, US_MIN, US_MAX);
   esc_ti.attach(PIN_ESCti, US_MIN, US_MAX);
-  
 
-  // Armado seguro
-  setThrottlePercent(0, Ref_dd);           // objetivo 60%
-  setThrottlePercent(0, Ref_di); 
-  setThrottlePercent(0, Ref_td); 
-  setThrottlePercent(0, Ref_ti);
-  
-  updateThrottle(esc_dd, Ref_dd);
-  updateThrottle(esc_di, Ref_di);
-  updateThrottle(esc_td, Ref_td);
-  updateThrottle(esc_ti, Ref_ti);
+  setThrottlePercent(0, Ref_dd); setThrottlePercent(0, Ref_di);
+  setThrottlePercent(0, Ref_td); setThrottlePercent(0, Ref_ti);
+  updateThrottle(esc_dd, Ref_dd); updateThrottle(esc_di, Ref_di);
+  updateThrottle(esc_td, Ref_td); updateThrottle(esc_ti, Ref_ti);
+  lastUpdateMs[Ref_dd] = lastUpdateMs[Ref_di] = lastUpdateMs[Ref_td] = lastUpdateMs[Ref_ti] = millis();
 
-  lastUpdateMs[Ref_dd] = millis();
-  lastUpdateMs[Ref_di] = lastUpdateMs[Ref_dd];
-  lastUpdateMs[Ref_td] = lastUpdateMs[Ref_dd];
-  lastUpdateMs[Ref_ti] = lastUpdateMs[Ref_dd];
- 
-  //***************Configuración Sensor ultrasonico*******************
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  digitalWrite(TRIG_PIN, LOW);  // Asegura que TRIG comience en LOW
+  digitalWrite(TRIG_PIN, LOW);
   attachInterrupt(ECHO_PIN, Ultrasnd_PWM_int, CHANGE);
 
-  //*********Configurar I2C para IMU**************
   Wire.begin();
-  Wire.setClock(400000); 
+  Wire.setClock(400000);
   Wire.beginTransmission(MPU_addr);
-  Wire.write(0x6B);  // PWR_MGMT_1 register
-  Wire.write(0);     // set to zero (wakes up the MPU-6050)
-  Wire.endTransmission(true); 
-  
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
   delay(STARTUP_MS);
 
-  // Inicializar variables de tiempo para evitar ejecuciones inmediatas al arrancar
-  LastCtrl        = micros();
-  LastActlz       = micros();
-  LastMedIMU      = micros();
-  lastTriggerTime = micros();
+  unsigned long ahora = micros();
+  st_imuLastUs = st_ultraLastUs = st_ctrlLastUs = st_motorLastUs = ahora;
+
+  resetStatsA();
+  resetStatsB();
+
+  unsigned long ahoraMs = millis();
+  statsLastPrintMsA = ahoraMs;
+  statsLastPrintMsB = ahoraMs - (STATS_INTERVAL_MSB / 2);
+
+  Serial.println(F("=== TEST DE LATENCIA ACTIVO ==="));
+  Serial.println(F("    Modo: SLAVE MIDE EL TIEMPO"));
+  Serial.print(F("    PWM base: ")); Serial.print(PWM_BASE_PCT); Serial.println(F(" %"));
+  Serial.print(F("    PWM escalon: ")); Serial.print(PWM_STEP_PCT); Serial.println(F(" %"));
+  Serial.println(F("    Sentinel: IMU.tmp = 30000"));
+  Serial.println(F("================================"));
 }
 
-
-void loop() 
+// ============================================================
+void loop()
 {
-  const uint32_t loop_t0 = micros();
+  uint32_t loopStart = micros();
 
-//****************MEDIDA DE LA IMU****************************
-  if (micros() - LastMedIMU > PeriodMedIMU) 
+  // ---- 1. IMU ----
+  if (micros() - LastMedIMU > PeriodMedIMU)
   {
-    const uint32_t now = micros();
-    if (lastIMU_us) stats_add(stIMU_Per, now - lastIMU_us);
-    lastIMU_us = now;
+    digitalWrite(OSC_PIN, !digitalRead(OSC_PIN));
+    //uint32_t t0 = micros();
+    //uint32_t periodo = t0 - (uint32_t)st_imuLastUs;
+    //if (periodo > st_imuPeriodMaxUs) st_imuPeriodMaxUs = periodo;
+    //if (periodo < st_imuPeriodMinUs) st_imuPeriodMinUs = periodo;
+    //st_imuLastUs = t0;
+    //uint32_t tWork = micros();
 
-    const uint32_t t0 = micros();
     Wire.beginTransmission(MPU_addr);
-    Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+    Wire.write(0x3B);
     Wire.endTransmission(false);
-    Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
-    IMU.ax = Wire.read()<<8|Wire.read();  // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)    
-    IMU.ay = Wire.read()<<8|Wire.read();  // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-    IMU.az = Wire.read()<<8|Wire.read();  // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-    IMU.tmp = Wire.read()<<8|Wire.read();  // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-    IMU.gx = Wire.read()<<8|Wire.read();  // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-    IMU.gy = Wire.read()<<8|Wire.read();  // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-    IMU.gz = Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+
+    // Solo actualizamos si nos devuelven los 14 bytes correctos
+    if (Wire.requestFrom(MPU_addr, 14, true) == 14)
+    {
+      IMU.ax  = Wire.read() << 8 | Wire.read();
+      IMU.ay  = Wire.read() << 8 | Wire.read();
+      IMU.az  = Wire.read() << 8 | Wire.read();
+      IMU.tmp = Wire.read() << 8 | Wire.read();
+      IMU.gx  = Wire.read() << 8 | Wire.read();
+      IMU.gy  = Wire.read() << 8 | Wire.read();
+      IMU.gz  = Wire.read() << 8 | Wire.read();
+    }
+
     LastMedIMU = micros();
 
-    const uint32_t dt = LastMedIMU - t0;
-    stats_add(stIMU, dt);
-    if (dt > PeriodMedIMU) ovIMU++; // IMU tardó más que su propio periodo objetivo
-  } 
+    //uint32_t work = LastMedIMU - tWork;
+    //if (work > st_imuWorkMaxUs) st_imuWorkMaxUs = work;
+    //if (work < st_imuWorkMinUs) st_imuWorkMinUs = work;
 
-//****************SENSOR ULTRASONICO****************************
-  // Paso 1: Enviar pulso TRIG cada PeriodMedUltsnd (20 ms)
-  if ((Estado_ultrsnd == INICIAL) && micros() - lastTriggerTime >= PeriodMedUltsnd) 
+    // Mostrar tmp siempre para ver la transicion
+    static int16_t tmpUltimo = 0;
+    if (IMU.tmp != tmpUltimo) 
+    {
+      tmpUltimo = IMU.tmp;
+      if (IMU.tmp != (int16_t)0xFFFF) 
+      {
+        Serial.print(F("tmp: "));
+        Serial.println(IMU.tmp);
+      }
+    }
+  }
+
+  // ---- 2. Ultrasonidos ----
+  if ((Estado_ultrsnd == INICIAL) && (micros() - lastTriggerTime >= PeriodMedUltsnd))
   {
-    const uint32_t now = micros();
-    if (lastUltra_us) stats_add(stUltra_Per, now - lastUltra_us);
-    lastUltra_us = now;
+    //uint32_t t0 = micros();
+    //uint32_t periodo = t0 - (uint32_t)st_ultraLastUs;
+    //if (periodo > st_ultraPeriodMaxUs) st_ultraPeriodMaxUs = periodo;
+    //if (periodo < st_ultraPeriodMinUs) st_ultraPeriodMinUs = periodo;
+    //st_ultraLastUs = t0;
+    //uint32_t tWork = micros();
 
-    const uint32_t t0 = micros();
     digitalWrite(TRIG_PIN, HIGH);
-    delayMicroseconds(20); // Pulso de 20us
+    delayMicroseconds(20);
     digitalWrite(TRIG_PIN, LOW);
     lastTriggerTime = micros();
-    Estado_ultrsnd = ECHO_START; // Espera señal ECHO  
-    
-    stats_add(stUltraTrig, micros() - t0);
+    Estado_ultrsnd  = ECHO_START;
+
+    //uint32_t work = micros() - tWork;
+    //if (work > st_ultraWorkMaxUs) st_ultraWorkMaxUs = work;
+    //if (work < st_ultraWorkMinUs) st_ultraWorkMinUs = work;
   }
 
-//*******************Control************************
-  if (micros() - LastCtrl > Periodo_Ctrl) 
+  if (nuevaMedidaUltrasonido)
   {
-    const uint32_t now = micros();
-    if (lastCtrl_us) stats_add(stCtrl_Per, now - lastCtrl_us);
-    lastCtrl_us = now;  
+    nuevaMedidaUltrasonido = false;
+    Dist_ultrasonicos = echoEndTime * 0.0343f / 2.0f; 
+  }
+
+  // ---- 3. REBOTE DE ESCALON ----
+  if (modoTestLatencia)
+  {
+    float pwmTest;
+    // Si el Slave inyectó el 30000, subimos el PWM. Si no, lo mantenemos base.
+    if (IMU.tmp == SENTINEL_TMP) pwmTest = PWM_STEP_PCT;
+    else pwmTest = PWM_BASE_PCT;
     
-    const uint32_t t0 = micros();
-    // Calculo de errores
-    float Error_alt;
-    float Error_incl;
+    // Forzamos el cambio para no depender del PID
+    for (int i = 0; i < 4; i++)
+    {
+      throttleCurrentPct[i] = pwmTest;
+      throttleTargetPct[i]  = pwmTest;
+      lastUpdateMs[i]       = millis();
+    }
+  }
+
+  // ---- 4. PID ----
+  if (micros() - LastCtrl > Periodo_Ctrl && !modoTestLatencia)
+  {
+    //uint32_t t0 = micros();
+    //uint32_t periodo = t0 - (uint32_t)st_ctrlLastUs;
+    //if (periodo > st_ctrlPeriodMaxUs) st_ctrlPeriodMaxUs = periodo;
+    //if (periodo < st_ctrlPeriodMinUs) st_ctrlPeriodMinUs = periodo;
+    //st_ctrlLastUs = t0;
+    //uint32_t tWork = micros();
+
+    float inclinacion = atan2f(IMU.ay, -IMU.az);
+    float Error_alt   = Ref_altura - Dist_ultrasonicos * cosf(inclinacion);
+    float Error_incl  = sinf(Ref_incl - inclinacion);
     float Error_incl_derv;
-    float inclinacion;
-    LastCtrl = micros();
-    inclinacion = atan2f(IMU.ay, -IMU.az);
-    Error_alt = Ref_altura - Dist_ultrasonicos*cosf(inclinacion);
-    Error_incl = sin(Ref_incl - inclinacion);
 
-    // Lazo de control Proporcional Integral Derivativo
-    Integral_asc += Error_alt*Periodo_Ctrl*KI_asc/1000000.;
-    Integral_asc= constrain(Integral_asc,Min_Consg_motor,Max_Consg_motor);
+    Integral_asc  += Error_alt  * Periodo_Ctrl * KI_asc  / 1000000.0f;
+    Integral_asc   = constrain(Integral_asc, (float)Min_Consg_motor, (float)Max_Consg_motor);
+    Integral_incl += Error_incl * Periodo_Ctrl * KI_incl / 1000000.0f;
+    Integral_incl  = constrain(Integral_incl, -4.0f, 4.0f);
 
-    Integral_incl += Error_incl*Periodo_Ctrl*KI_incl/1000000.;
-    Integral_incl = constrain(Integral_incl,-4,4);
+    Consgn_motor_ascnd = Error_alt * KP_asc + Integral_asc + (Error_alt - Error_alt_ant) * KD_asc / Periodo_Ctrl;
+    Consgn_motor_ascnd = constrain(Consgn_motor_ascnd, (float)Min_Consg_motor, (float)Max_Consg_motor);
 
-    Consgn_motor_ascnd = Error_alt*KP_asc+Integral_asc+(Error_alt-Error_alt_ant)*KD_asc/Periodo_Ctrl;  
-    Consgn_motor_ascnd = constrain(Consgn_motor_ascnd,Min_Consg_motor,Max_Consg_motor);
+    Error_incl_derv    = (Error_incl - Error_incl_ant) * KD_incl / Periodo_Ctrl;
+    Consgn_motor_incl  = Error_incl * KP_incl + Integral_incl + Error_incl_derv;
+    Consgn_motor_incl  = constrain(Consgn_motor_incl, -5.0f, 5.0f);
 
-    Error_incl_derv = (Error_incl-Error_incl_ant)*KD_incl/Periodo_Ctrl;
-    Consgn_motor_incl = Error_incl*KP_incl+Integral_incl+Error_incl_derv;  
-    Consgn_motor_incl = constrain(Consgn_motor_incl,-5,5);
-
-    //Consgn_motor_incl=0;
-    //Consgn_motor_ascnd=20;
-
-    Error_alt_ant = Error_alt;
+    Error_alt_ant  = Error_alt;
     Error_incl_ant = Error_incl;
-    //Establece consigna de motores
-    Consgn_motor_ascnd = Min_Consg_motor;   //Descarga motor con mínima potencia
-    Consgn_motor_incl = 0;
 
-    const uint32_t dt_ctrl = micros() - t0;
-    stats_add(stCtrl, dt_ctrl);
-    if (dt_ctrl > Periodo_Ctrl) ovCtrl++;
-
-    const uint32_t tp0 = micros();
-    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_dd);           
-    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_di); 
-    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_td); 
-    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_ti); 
-    stats_add(stPWMTarget, micros() - tp0);
+    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_dd);
+    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_di);
+    setThrottlePercent(Consgn_motor_ascnd + Consgn_motor_incl, Ref_td);
+    setThrottlePercent(Consgn_motor_ascnd - Consgn_motor_incl, Ref_ti);
     
-    #if DEBUG_CONTROL_PRINTS
-    // NO recomendado durante medidas
-        Serial.print("Tiempo = "); 
-        Serial.print(millis());
-
-        Serial.print("s  Distancia = "); 
-        Serial.print(Dist_ultrasonicos);
-        
-        Serial.print("cm  Integral = "); 
-        Serial.print(Integral_asc);
-
-        Serial.print(" Consigna_asc = "); 
-        Serial.print(Consgn_motor_ascnd);
-        
-        Serial.print(" Motor_dd = "); 
-        Serial.println(throttleCurrentPct[Ref_dd]);
-    #endif
+    LastCtrl = micros();
+    //uint32_t work = LastCtrl - tWork;
+    //if (work > st_ctrlWorkMaxUs) st_ctrlWorkMaxUs = work;
+    //if (work < st_ctrlWorkMinUs) st_ctrlWorkMinUs = work;
   }
-  
 
-//Actualiza estado motores
-  if (micros() - LastActlz > Periodo_Actlz) 
+  // ---- 5. Motores ----
+  if (micros() - LastActlz > Periodo_Actlz)
   {
-    const uint32_t now = micros();
-    if (lastEsc_us) stats_add(stEsc_Per, now - lastEsc_us);
-    lastEsc_us = now;
+    //uint32_t t0 = micros();
+    //uint32_t periodo = t0 - (uint32_t)st_motorLastUs;
+    //if (periodo > st_motorPeriodMaxUs) st_motorPeriodMaxUs = periodo;
+    //if (periodo < st_motorPeriodMinUs) st_motorPeriodMinUs = periodo;
+    //st_motorLastUs = t0;
+    //uint32_t tWork = micros();
 
-    const uint32_t t0 = micros();
-    LastActlz = micros();
     updateThrottle(esc_dd, Ref_dd);
     updateThrottle(esc_di, Ref_di);
     updateThrottle(esc_td, Ref_td);
     updateThrottle(esc_ti, Ref_ti);
-    stats_add(stEscUpdate, micros() - t0);
+    LastActlz = micros();
+
+    //uint32_t work = LastActlz - tWork;
+    //if (work > st_motorWorkMaxUs) st_motorWorkMaxUs = work;
+    //if (work < st_motorWorkMinUs) st_motorWorkMinUs = work;
   }
 
-  // ---------- Loop total ----------
-  stats_add(stLoop, micros() - loop_t0);
+  /*
+  // ---- 6. Duración de iteración ----
+  uint32_t loopDur = micros() - loopStart;
+  if (loopDur > st_loopMaxUs) st_loopMaxUs = loopDur;
+  if (loopDur < st_loopMinUs) st_loopMinUs = loopDur;
 
-  // ---------- Reporte agregado cada 1s ----------
-  static uint32_t rep_ms = 0;
-  if ((uint32_t)(millis() - rep_ms) >= 1000) 
+  // ---- 7. Estadísticas por Serie ----
+  unsigned long ahoraMs = millis();
+  if (ahoraMs - statsLastPrintMsA >= STATS_INTERVAL_MSA)
   {
-    rep_ms = millis();
-
-    Serial.println("=== PROFILER 1s ===");
-    Serial.printf("Loop:      n=%lu avg=%luus max=%luus\n", (unsigned long)stLoop.n, (unsigned long)stats_avg(stLoop), (unsigned long)stLoop.max_us);
-
-    Serial.printf("IMU:       n=%lu avg=%luus max=%luus | period avg=%luus max=%luus | ov=%lu\n",
-      (unsigned long)stIMU.n, (unsigned long)stats_avg(stIMU), (unsigned long)stIMU.max_us,
-      (unsigned long)stats_avg(stIMU_Per), (unsigned long)stIMU_Per.max_us,
-      (unsigned long)ovIMU);
-
-    Serial.printf("UltraTrig: n=%lu avg=%luus max=%luus | period avg=%luus max=%luus\n",
-      (unsigned long)stUltraTrig.n, (unsigned long)stats_avg(stUltraTrig), (unsigned long)stUltraTrig.max_us,
-      (unsigned long)stats_avg(stUltra_Per), (unsigned long)stUltra_Per.max_us);
-
-    Serial.printf("Ctrl:      n=%lu avg=%luus max=%luus | period avg=%luus max=%luus | ov=%lu\n",
-      (unsigned long)stCtrl.n, (unsigned long)stats_avg(stCtrl), (unsigned long)stCtrl.max_us,
-      (unsigned long)stats_avg(stCtrl_Per), (unsigned long)stCtrl_Per.max_us,
-      (unsigned long)ovCtrl);
-
-    Serial.printf("PWMTarget: n=%lu avg=%luus max=%luus\n", (unsigned long)stPWMTarget.n, (unsigned long)stats_avg(stPWMTarget), (unsigned long)stPWMTarget.max_us);
-    Serial.printf("ESCupdate: n=%lu avg=%luus max=%luus | period avg=%luus max=%luus\n",
-      (unsigned long)stEscUpdate.n, (unsigned long)stats_avg(stEscUpdate), (unsigned long)stEscUpdate.max_us,
-      (unsigned long)stats_avg(stEsc_Per), (unsigned long)stEsc_Per.max_us);
-
-    // reset ventana
-    stats_reset(stLoop); stats_reset(stIMU); stats_reset(stUltraTrig); stats_reset(stCtrl);
-    stats_reset(stPWMTarget); stats_reset(stEscUpdate);
-    stats_reset(stIMU_Per); stats_reset(stUltra_Per); stats_reset(stCtrl_Per); stats_reset(stEsc_Per);
-    ovCtrl = ovIMU = 0;
+    if (abs((long)(ahoraMs - statsLastPrintMsB)) > STATS_GUARD_MS)
+    {
+      printStatsA();
+      resetStatsA();
+      statsLastPrintMsA = ahoraMs;
+    }
   }
 
-  
+  if (ahoraMs - statsLastPrintMsB >= STATS_INTERVAL_MSB)
+  {
+    if (abs((long)(ahoraMs - statsLastPrintMsA)) > STATS_GUARD_MS)
+    {
+      printStatsB();
+      resetStatsB();
+      statsLastPrintMsB = ahoraMs;
+    }
+  } 
+  */
 }
